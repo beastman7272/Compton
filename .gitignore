@@ -25,3 +25,6 @@ sa.json
 credentials.json
 cqe_state.json
 orchestrator_token.json
+
+# Ignore playwright results
+playwright_results.json

@@ -47,14 +47,14 @@ PROJECT SEARCH RULES:
 
   DO NOT STOP TO ASK FOR PERMISSION OR CONFIRMATION! You must operate unattended.
 
-PROCESS THESE 2 PROJECT(S) IN ORDER:
+PROCESS THESE 3 PROJECT(S) IN ORDER:
 ============================================================
 
-PROJECT 1/2: Spencer's 2294 Elizabethtown, KY
+PROJECT 1/3: Sweet Paris Creperie & Cafe - Huntsville
 ----------------------------------------
 Action: Find project → note details → download files
 Steps:
-  1. Find "Spencer's 2294 Elizabethtown, KY" in the Undecided tab
+  1. Find "Sweet Paris Creperie & Cafe - Huntsville" in the Undecided tab
   2. Note the Location, Project Size, and Due Date
   3. Go to the Files tab
   4. Open all folders EXCEPT those matching the folder skip list above
@@ -63,11 +63,24 @@ Steps:
   6. Click Download Selected, wait 60 seconds
 
 
-PROJECT 2/2: Boys & Girls Club REBID - Copperhill, TN
+PROJECT 2/3: Lenoir, TN - Casey's #5127
 ----------------------------------------
 Action: Find project → note details → download files
 Steps:
-  1. Find "Boys & Girls Club REBID - Copperhill, TN" in the Undecided tab
+  1. Find "Lenoir, TN - Casey's #5127" in the Undecided tab
+  2. Note the Location, Project Size, and Due Date
+  3. Go to the Files tab
+  4. Open all folders EXCEPT those matching the folder skip list above
+     (but DO open folders that also contain Plans/Specifications/Specs)
+  5. Select all files EXCEPT those matching the file skip list above
+  6. Click Download Selected, wait 60 seconds
+
+
+PROJECT 3/3: Jeffersontown Commons
+----------------------------------------
+Action: Find project → note details → download files
+Steps:
+  1. Find "Jeffersontown Commons" in the Undecided tab
   2. Note the Location, Project Size, and Due Date
   3. Go to the Files tab
   4. Open all folders EXCEPT those matching the folder skip list above

@@ -87,6 +87,7 @@ BID_BOARD_SHEET_ID = "14PMQx_SiNkSX2gLWtfjsIEpovmADJpv1f53bhICQKfY"
 
 COMET_PROMPT_FILE = "comet_prompt.txt"
 RUN_STATE_FILE = "run_state.json"
+PLAYWRIGHT_RESULTS_FILE = "playwright_results.json"
 
 SKIP_BRANDS = []
 # SKIP_BRANDS = ["advance auto parts", "aldi", "autozone", "barnes & noble", "basss pro shops", "bath & body works", 
@@ -650,11 +651,13 @@ def apply_result(service, task, result, bb_data):
     if note:
         files_str += f", {note}"
 
-    if result.get("status") == "NOT FOUND":
-        print(f"  → {project}: NOT FOUND — Processing Error")
+    if result.get("status") in ("NOT FOUND", "ERROR"):
+        status = result.get("status")
+        error_note = result.get("error") or "Project not found on BuildingConnected"
+        print(f"  → {project}: {status} — Processing Error")
         update_cell(service, EMAILS_SHEET_ID, f"Sheet1!F{email_row}", "Processing Error")
         append_row(service, BID_BOARD_SHEET_ID, "Sheet1!A:G", [
-            project, scope, "--", "--", "--", "Project not found on BuildingConnected", "Processing Error"
+            project, scope, "--", "--", "--", error_note, "Processing Error"
         ])
         return
 
@@ -695,6 +698,127 @@ def apply_result(service, task, result, bb_data):
         print(f"  → {project}: Updated + Processed")
 
 
+# ── Phase 2: Playwright browser run ───────────────────────────────────────
+def phase2_playwright_run(
+    service,
+    *,
+    browser="chrome",
+    cdp_url=None,
+    headless=False,
+    select_files=False,
+    download_files=False,
+    apply_results=False,
+):
+    print("\n" + "=" * 70)
+    print("PHASE 2 — Playwright: process BuildingConnected browser tasks")
+    print("=" * 70)
+
+    if not os.path.exists(RUN_STATE_FILE):
+        print(f"\nNo {RUN_STATE_FILE} found. Run Phase 1 first.")
+        return
+
+    with open_utf8(RUN_STATE_FILE, "r") as f:
+        tasks = json.load(f)
+
+    if not tasks:
+        print("\nNo pending browser tasks in run state.")
+        return
+
+    if apply_results and not (select_files or download_files):
+        print("\nRefusing to apply Playwright results without file selection.")
+        print("Rerun with --playwright-select-files or --playwright-download-files.")
+        return
+
+    try:
+        from playwright.sync_api import sync_playwright
+        from buildingconnected_playwright import (
+            DOWNLOAD_DIR,
+            NAV_TIMEOUT_MS,
+            attach_context,
+            launch_context,
+            process_project,
+        )
+    except ImportError as exc:
+        print(f"\nMissing Playwright dependency or helper import: {exc}")
+        print("Install Playwright dependencies before running --playwright-run.")
+        return
+
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    results = []
+
+    with sync_playwright() as pw:
+        browser_instance = None
+        if cdp_url:
+            browser_instance, context = attach_context(pw, cdp_url)
+        else:
+            context = launch_context(pw, browser, headless)
+
+        context.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+        page = context.pages[0] if context.pages else context.new_page()
+
+        try:
+            for idx, task in enumerate(tasks, start=1):
+                project = task["project"]
+                print(f"\n[{idx}/{len(tasks)}] {project}")
+                result = process_project(
+                    page,
+                    project,
+                    select_files=select_files or download_files,
+                    download_files=download_files,
+                    non_interactive=True,
+                    reuse_current_page=False,
+                )
+                results.append({"task": task, "result": result})
+
+                status = result.get("status", "ERROR")
+                files = result.get("files", [])
+                print(f"  Status: {status}")
+                print(f"  Files: {len(files)}")
+                if result.get("download_path"):
+                    print(f"  Download: {result['download_path']}")
+                if result.get("error"):
+                    print(f"  Error: {result['error']}")
+        finally:
+            if not cdp_url:
+                context.close()
+            elif browser_instance:
+                browser_instance.close()
+
+    with open_utf8(PLAYWRIGHT_RESULTS_FILE, "w") as f:
+        json.dump(results, f, indent=2)
+
+    print(f"\nPlaywright results saved to: {PLAYWRIGHT_RESULTS_FILE}")
+
+    if not apply_results:
+        print("\nSheets were not updated. Rerun with --apply-playwright-results after reviewing results.")
+        return
+
+    errors = [
+        item
+        for item in results
+        if item["result"].get("status") == "ERROR"
+    ]
+    if errors:
+        print("\nPlaywright returned errors; Sheets were not updated and run_state.json was kept.")
+        print("Review playwright_results.json, fix the issue, then rerun the workflow.")
+        return
+
+    bb_rows = read_sheet(service, BID_BOARD_SHEET_ID, "Sheet1!A1:G1000")
+    bb_data = bb_rows[1:] if len(bb_rows) > 1 else []
+
+    print("\nApplying Playwright results to Sheets...")
+    for item in results:
+        task = item["task"]
+        result = item["result"]
+        apply_result(service, task, result, bb_data)
+        if task["action"] == "new_project":
+            bb_rows = read_sheet(service, BID_BOARD_SHEET_ID, "Sheet1!A1:G1000")
+            bb_data = bb_rows[1:] if len(bb_rows) > 1 else []
+
+    os.remove(RUN_STATE_FILE)
+    print("\n✓ Playwright finalization complete. Run state cleared.")
+
+
 # ── Status ────────────────────────────────────────────────────────────────
 def show_status(service):
     email_rows = read_sheet(service, EMAILS_SHEET_ID, "Sheet1!A1:F1000")
@@ -717,7 +841,7 @@ def show_status(service):
         if s == "(unprocessed)":
             flag = "  ← run Phase 1"
         elif s == "Awaiting Comet":
-            flag = "  ← run Comet, then --finalize"
+            flag = "  ← run --playwright-run or Comet, then finalize/apply"
         print(f"  {s:25s} {counts[s]}{flag}")
 
     print(f"\nBid Board: {len(bb_rows) - 1} entries")
@@ -725,8 +849,9 @@ def show_status(service):
     if os.path.exists(RUN_STATE_FILE):
         with open_utf8(RUN_STATE_FILE, "r") as f:
             tasks = json.load(f)
-        print(f"\nPending: {len(tasks)} task(s) awaiting Comet results")
-        print(f"  → Run Comet with {COMET_PROMPT_FILE}, then: --finalize")
+        print(f"\nPending: {len(tasks)} browser task(s)")
+        print("  → Playwright: --playwright-run --playwright-select-files")
+        print(f"  → Comet fallback: use {COMET_PROMPT_FILE}, then --finalize")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────
@@ -735,7 +860,36 @@ def main():
     parser.add_argument("--status", action="store_true", help="Show queue status")
     parser.add_argument("--finalize", action="store_true",
                         help="Phase 3: record Comet results and update sheets")
+    parser.add_argument("--playwright-run", action="store_true",
+                        help="Phase 2: process run_state.json browser tasks with Playwright")
+    parser.add_argument("--run-playwright-workflow", action="store_true",
+                        help="Run Phase 1, then Playwright download/apply in one command")
+    parser.add_argument("--playwright-browser", choices=["auto", "chrome", "msedge", "chromium"],
+                        default="chrome", help="Browser channel for Playwright runs")
+    parser.add_argument("--playwright-cdp-url",
+                        help="Attach Playwright to an existing Chrome/Edge debugging session")
+    parser.add_argument("--playwright-headless", action="store_true",
+                        help="Run Playwright browser headless")
+    parser.add_argument("--playwright-select-files", action="store_true",
+                        help="Select eligible files but do not download them")
+    parser.add_argument("--playwright-download-files", action="store_true",
+                        help="Download selected eligible files to ~/Downloads")
+    parser.add_argument("--apply-playwright-results", action="store_true",
+                        help="Apply Playwright results to Sheets and clear run_state.json")
     args = parser.parse_args()
+
+    playwright_flag_without_run = (
+        args.playwright_browser != "chrome"
+        or args.playwright_cdp_url
+        or args.playwright_headless
+        or args.playwright_select_files
+        or args.playwright_download_files
+        or args.apply_playwright_results
+    )
+    if not args.playwright_run and playwright_flag_without_run:
+        if not args.run_playwright_workflow:
+            parser.error("Playwright options require --playwright-run or --run-playwright-workflow")
+
     try:
         service = get_sheets_service()
 
@@ -743,6 +897,27 @@ def main():
             show_status(service)
         elif args.finalize:
             phase3_finalize(service)
+        elif args.run_playwright_workflow:
+            phase1_process(service)
+            phase2_playwright_run(
+                service,
+                browser=args.playwright_browser,
+                cdp_url=args.playwright_cdp_url,
+                headless=args.playwright_headless,
+                select_files=True,
+                download_files=True,
+                apply_results=True,
+            )
+        elif args.playwright_run:
+            phase2_playwright_run(
+                service,
+                browser=args.playwright_browser,
+                cdp_url=args.playwright_cdp_url,
+                headless=args.playwright_headless,
+                select_files=args.playwright_select_files,
+                download_files=args.playwright_download_files,
+                apply_results=args.apply_playwright_results,
+            )
         else:
             phase1_process(service)
     except HttpError as exc:

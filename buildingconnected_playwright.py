@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
+import json
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 
 from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import ElementHandle, Locator, Page, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 START_URL = "https://app.buildingconnected.com/opportunities/pipeline"
@@ -18,6 +21,7 @@ DEFAULT_PROJECT = "Lee County General Services Building Expansion"
 LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled", "--start-maximized"]
 NAV_TIMEOUT_MS = 120_000
 DOWNLOAD_TIMEOUT_MS = 180_000
+LOG_ENABLED = True
 SKIP_FOLDER_KEYWORDS = [
     "assessment", "budget", "cad", "drawings", "drws", "dwgs", "geotech", "geo-tech",
     "geotechnical", "manual", "narrative", "pay request", "permit", "photos", "pricing",
@@ -64,7 +68,8 @@ class BidRow:
 
 
 def log(message: str) -> None:
-    print(f"[BC] {message}")
+    if LOG_ENABLED:
+        print(f"[BC] {message}")
 
 
 def norm(value: str) -> str:
@@ -118,22 +123,26 @@ def click_text_if_visible(page: Page, text: str, timeout: int = 8_000) -> bool:
         return False
 
 
-def open_pipeline(page: Page) -> None:
+def open_pipeline(page: Page, *, non_interactive: bool = False) -> None:
     try:
         page.goto(START_URL, wait_until="commit", timeout=NAV_TIMEOUT_MS)
     except PlaywrightTimeoutError:
+        if non_interactive:
+            raise RuntimeError("Timed out opening BuildingConnected; login/MFA may be required.")
         pause_for_user("Timed out opening BuildingConnected. The browser may be waiting on Autodesk login.")
 
     page.wait_for_timeout(3_000)
 
 
-def ensure_pipeline(page: Page) -> None:
+def ensure_pipeline(page: Page, *, non_interactive: bool = False) -> None:
     log("Opening BuildingConnected pipeline")
-    open_pipeline(page)
+    open_pipeline(page, non_interactive=non_interactive)
 
     if not click_text_if_visible(page, "Undecided", timeout=12_000):
+        if non_interactive:
+            raise RuntimeError("Could not click the Undecided tab; login/MFA may be required.")
         pause_for_user("Could not click the Undecided tab. Login/MFA may be required.")
-        open_pipeline(page)
+        open_pipeline(page, non_interactive=non_interactive)
         if not click_text_if_visible(page, "Undecided", timeout=12_000):
             raise RuntimeError("Could not reach the Undecided bid board.")
 
@@ -884,10 +893,16 @@ def select_file_by_name(page: Page, file_name: str) -> bool:
     return bool(
         page.evaluate(
             """
-            (fileName) => {
+            async (fileName) => {
               const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
               const target = clean(fileName).toLowerCase();
-              const nodes = [...document.querySelectorAll('div, span, a, [role=row], tr')]
+              const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+              const checked = (el) =>
+                Boolean(el.checked) ||
+                el.getAttribute('aria-checked') === 'true' ||
+                el.className?.toString().toLowerCase().includes('checked');
+
+              const nodes = [...document.querySelectorAll('div, span, a, [role=row], tr, [class*=row], [class*=Row]')]
                 .map((el) => ({ el, text: clean(el.innerText || el.textContent || '') }))
                 .filter(({ text }) => {
                   const lower = text.toLowerCase();
@@ -896,25 +911,44 @@ def select_file_by_name(page: Page, file_name: str) -> bool:
                 .sort((a, b) => a.text.length - b.text.length);
 
               for (const { el } of nodes) {
-                const row = el.closest('[role=row], tr, [class*=row], [class*=Row]') || el.parentElement || el;
+                const containers = [];
+                let node = el;
+                for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
+                  containers.push(node);
+                }
+
+                const row = containers.find((candidate) =>
+                  candidate.matches?.('[role=row], tr, [class*=row], [class*=Row]')
+                ) || containers.find((candidate) => {
+                  const rect = candidate.getBoundingClientRect();
+                  return rect.width > 250 && rect.height > 18;
+                }) || el.parentElement || el;
+
                 const checkbox = row.querySelector(
                   'input[type=checkbox], [role=checkbox], [aria-checked]'
                 );
 
                 if (checkbox) {
                   checkbox.scrollIntoView({ block: 'center' });
-                  checkbox.click();
-                  return true;
+                  if (!checked(checkbox)) {
+                    checkbox.click();
+                    await sleep(150);
+                  }
+                  if (checked(checkbox)) return true;
                 }
 
                 const rect = row.getBoundingClientRect();
                 if (rect.width > 60 && rect.height > 12) {
-                  const x = Math.max(5, Math.min(rect.left + 22, window.innerWidth - 5));
+                  const x = Math.max(5, Math.min(rect.left + 18, window.innerWidth - 5));
                   const y = Math.max(5, Math.min(rect.top + rect.height / 2, window.innerHeight - 5));
                   const targetAtPoint = document.elementFromPoint(x, y);
                   if (targetAtPoint) {
                     targetAtPoint.click();
-                    return true;
+                    await sleep(150);
+                    const nowChecked = row.querySelector(
+                      'input[type=checkbox]:checked, [role=checkbox][aria-checked=true], [aria-checked=true]'
+                    );
+                    if (nowChecked) return true;
                   }
                 }
               }
@@ -1095,13 +1129,131 @@ def unique_download_path(filename: str) -> Path:
     raise RuntimeError(f"Could not create unique download path for {filename}")
 
 
+def selected_download_button(page: Page) -> Locator | ElementHandle | None:
+    candidates = [
+        page.get_by_role("button", name=re.compile(r"download\s+selected", re.I)).first,
+        page.locator("button:has-text('Download Selected')").first,
+        page.locator("a:has-text('Download Selected')").first,
+        page.locator("[role=button]:has-text('Download Selected')").first,
+        page.get_by_text(re.compile(r"download\s+selected", re.I)).first,
+    ]
+
+    for candidate in candidates:
+        try:
+            candidate.wait_for(state="visible", timeout=4_000)
+            return candidate
+        except Exception:
+            continue
+
+    handle = page.evaluate_handle(
+        """
+        () => {
+          const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+          const nodes = [...document.querySelectorAll('button, a, [role=button], div, span')];
+          const matches = nodes
+            .map((el) => {
+              const label = clean([
+                el.innerText || el.textContent || '',
+                el.getAttribute('aria-label') || '',
+                el.getAttribute('title') || '',
+              ].join(' '));
+              return { el, label };
+            })
+            .filter(({ el, label }) => {
+              if (!label.includes('download selected') || label.includes('download all')) return false;
+              const rect = el.getBoundingClientRect();
+              const visible = rect.width > 1 && rect.height > 1 && getComputedStyle(el).visibility !== 'hidden';
+              return visible;
+            })
+            .sort((a, b) => a.label.length - b.label.length);
+
+          const match = matches[0];
+          if (!match) return null;
+
+          return match.el.closest('button, a, [role=button]') || match.el;
+        }
+        """
+    )
+    element = handle.as_element()
+    if element:
+        return element
+
+    toolbar_handle = page.evaluate_handle(
+        """
+        () => {
+          const checked = document.querySelectorAll(
+            'input[type=checkbox]:checked, [aria-checked=true]'
+          ).length;
+          if (!checked) return null;
+
+          const toolbar = document.querySelector('[data-id="file-list-tools"]');
+          if (!toolbar) return null;
+
+          const candidates = [...toolbar.querySelectorAll('div, button, a, [role=button]')]
+            .map((el) => ({ el, rect: el.getBoundingClientRect() }))
+            .filter(({ rect }) => rect.width > 20 && rect.height > 20)
+            .sort((a, b) => a.rect.left - b.rect.left || a.rect.top - b.rect.top);
+
+          return candidates[0]?.el || null;
+        }
+        """
+    )
+    return toolbar_handle.as_element()
+
+
+def selected_download_diagnostics(page: Page) -> str:
+    details = page.evaluate(
+        """
+        () => {
+          const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+          const controls = [...document.querySelectorAll('button, a, [role=button], [aria-label], [title]')]
+            .map((el) => clean([
+              el.innerText || el.textContent || '',
+              el.getAttribute('aria-label') || '',
+              el.getAttribute('title') || '',
+            ].join(' ')))
+            .filter((label) => /download/i.test(label))
+            .slice(0, 12);
+
+          const checked = [...document.querySelectorAll('input[type=checkbox]:checked, [aria-checked=true]')].length;
+          return { controls, checked };
+        }
+        """
+    )
+    controls = details.get("controls") or []
+    checked = details.get("checked", 0)
+    labels = "; ".join(controls) if controls else "none"
+    return f"visible download controls: {labels}; checked controls: {checked}"
+
+
+def click_selected_download_button(page: Page, button: Locator | ElementHandle) -> None:
+    try:
+        button.click()
+    except Exception:
+        page.evaluate(
+            """
+            (el) => {
+              el.scrollIntoView({ block: 'center', inline: 'center' });
+              el.click();
+            }
+            """,
+            button,
+        )
+
+
 def download_selected_files(page: Page) -> Path:
-    log("Clicking Download All for selected files")
-    button = page.get_by_text("Download All", exact=False).first
-    button.wait_for(state="visible", timeout=20_000)
+    log("Clicking selected-files download control")
+    page.wait_for_timeout(1_000)
+    button = selected_download_button(page)
+    if button is None:
+        diagnostics = selected_download_diagnostics(page)
+        raise RuntimeError(
+            "No selected-files download button was found; refusing to click Download All. "
+            f"Diagnostics: {diagnostics}"
+        )
 
     with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as download_info:
-        button.click()
+        click_selected_download_button(page, button)
 
     download = download_info.value
     target = unique_download_path(download.suggested_filename)
@@ -1148,7 +1300,127 @@ def attach_context(pw, cdp_url: str):
     return browser, context
 
 
+def base_result(project: str) -> dict[str, object]:
+    return {
+        "project": project,
+        "status": "NOT FOUND",
+        "location": "",
+        "project_size": "",
+        "due_date": "",
+        "files": [],
+        "download_path": "",
+        "url": "",
+        "matched_text": "",
+        "error": "",
+    }
+
+
+def process_project(
+    page: Page,
+    project: str,
+    *,
+    project_url: str | None = None,
+    select_files: bool = False,
+    download_files: bool = False,
+    non_interactive: bool = True,
+    reuse_current_page: bool = True,
+) -> dict[str, object]:
+    """Run one BuildingConnected project and return orchestrator-ready data."""
+    result = base_result(project)
+
+    try:
+        if project_url:
+            log(f"Opening supplied project URL: {project_url}")
+            page.goto(project_url, wait_until="commit", timeout=NAV_TIMEOUT_MS)
+            page.wait_for_timeout(3_000)
+            candidate = Candidate(project, "", "", "URL", 2.0, project_url)
+        else:
+            existing_candidate = current_page_has_project(page, project) if reuse_current_page else None
+            if existing_candidate:
+                candidate = existing_candidate
+            else:
+                ensure_pipeline(page, non_interactive=non_interactive)
+                sort_by_name(page)
+                candidate = find_and_open_project(page, project)
+
+        if not candidate and not non_interactive:
+            pause_for_user("Project was not found automatically.")
+            candidate = find_and_open_project(page, project)
+
+        result["url"] = page.url
+        if not candidate:
+            return result
+
+        result["status"] = "FOUND"
+        result["matched_text"] = candidate.combined[:220]
+
+        if not is_project_detail_url(page.url):
+            result["status"] = "ERROR"
+            result["error"] = "Project matched, but the detail page did not open."
+            return result
+
+        details = extract_details(page)
+        result["location"] = details.get("Location", "") or "--"
+        result["project_size"] = details.get("Project Size", "") or "--"
+        result["due_date"] = details.get("Due Date", "") or "--"
+
+        if not open_files_tab(page):
+            result["error"] = "Files tab was not found/opened."
+            return result
+
+        if select_files or download_files:
+            selected = select_allowed_files(page)
+            result["files"] = selected
+            if download_files:
+                if selected:
+                    result["download_path"] = str(download_selected_files(page))
+                else:
+                    log("Download skipped: no files were selected.")
+        else:
+            result["classification"] = [
+                {"kind": kind, "action": action, "name": name, "reason": reason}
+                for kind, action, name, reason in classified_file_items(page)
+            ]
+
+        return result
+    except Exception as exc:
+        result["status"] = "ERROR"
+        result["url"] = page.url
+        result["error"] = str(exc)
+        return result
+
+
+def print_result(result: dict[str, object]) -> None:
+    print("\n" + "=" * 70)
+    print(f"Status: {result.get('status', '')}")
+    print(f"Project: {result.get('project', '')}")
+    if result.get("url"):
+        print(f"URL: {result['url']}")
+    if result.get("matched_text"):
+        print(f"Matched DOM Text: {str(result['matched_text'])[:220]}")
+    if result.get("status") == "FOUND":
+        print(f"Location: {result.get('location') or '--'}")
+        print(f"Project Size: {result.get('project_size') or '--'}")
+        print(f"Due Date: {result.get('due_date') or '--'}")
+        files = result.get("files") or []
+        if files:
+            print("\nSelected Files Summary:")
+            for file_name in files:
+                print(f"  - {file_name}")
+        if result.get("download_path"):
+            print(f"\nDownloaded File: {result['download_path']}")
+    if result.get("classification"):
+        print("\nFile Classification Preview:")
+        for row in result["classification"]:
+            print(f"  {row['action']:6} {row['kind']:6} {row['name']} ({row['reason']})")
+    if result.get("error"):
+        print(f"Error: {result['error']}")
+    print("=" * 70)
+
+
 def main() -> int:
+    global LOG_ENABLED
+
     parser = argparse.ArgumentParser(description="BuildingConnected Playwright POC")
     parser.add_argument("project", nargs="?", default=DEFAULT_PROJECT)
     parser.add_argument("--browser", choices=["auto", "chrome", "msedge", "chromium"], default="auto")
@@ -1157,7 +1429,11 @@ def main() -> int:
     parser.add_argument("--project-url", help="Open a known BuildingConnected project URL and skip bid-board search.")
     parser.add_argument("--select-files", action="store_true", help="Select eligible files but do not download.")
     parser.add_argument("--download-files", action="store_true", help="Select eligible files and download them to ~/Downloads.")
+    parser.add_argument("--json", action="store_true", help="Print structured JSON result data.")
+    parser.add_argument("--output-file", help="Write structured JSON result data to this path.")
+    parser.add_argument("--non-interactive", action="store_true", help="Return errors instead of pausing for manual browser fixes.")
     args = parser.parse_args()
+    LOG_ENABLED = not args.json
 
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1171,55 +1447,36 @@ def main() -> int:
         context.set_default_navigation_timeout(NAV_TIMEOUT_MS)
         page = context.pages[0] if context.pages else context.new_page()
 
-        if args.project_url:
-            log(f"Opening supplied project URL: {args.project_url}")
-            page.goto(args.project_url, wait_until="commit", timeout=NAV_TIMEOUT_MS)
-            page.wait_for_timeout(3_000)
-            candidate = Candidate(args.project, "", "", "URL", 2.0, args.project_url)
+        if args.json:
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = process_project(
+                    page,
+                    args.project,
+                    project_url=args.project_url,
+                    select_files=args.select_files,
+                    download_files=args.download_files,
+                    non_interactive=args.non_interactive,
+                )
         else:
-            existing_candidate = current_page_has_project(page, args.project)
-            if existing_candidate:
-                candidate = existing_candidate
-            else:
-                ensure_pipeline(page)
-                sort_by_name(page)
+            result = process_project(
+                page,
+                args.project,
+                project_url=args.project_url,
+                select_files=args.select_files,
+                download_files=args.download_files,
+                non_interactive=args.non_interactive,
+            )
 
-                candidate = find_and_open_project(page, args.project)
-        if not candidate:
-            pause_for_user("Project was not found automatically.")
-            candidate = find_and_open_project(page, args.project)
-
-        print("\n" + "=" * 70)
-        if not candidate:
-            print(f"Status: NOT FOUND\nProject: {args.project}")
+        if args.json:
+            print(json.dumps(result, indent=2))
         else:
-            details = extract_details(page)
-            print(f"Status: FOUND\nProject: {args.project}")
-            print(f"URL: {page.url}")
-            print(f"Matched DOM Text: {candidate.combined[:220]}")
-            if not is_project_detail_url(page.url):
-                print("Project detail page was not opened; skipping detail/files extraction.")
-            else:
-                for label, value in details.items():
-                    print(f"{label}: {value or '--'}")
-                if any(not value or value == "--" for value in details.values()):
-                    print_detail_hints(page)
-                if open_files_tab(page):
-                    print_visible_file_items(page)
-                    print_file_classification(page)
-                    preview_allowed_folders(page)
-                    if args.select_files or args.download_files:
-                        selected = select_allowed_files(page)
-                        if args.download_files:
-                            if selected:
-                                download_selected_files(page)
-                            else:
-                                print("\nDownload skipped: no files were selected.")
-                else:
-                    print("\nFiles tab was not found/opened.")
-        print("=" * 70)
+            print_result(result)
 
-        if not args.cdp_url:
+        if args.output_file:
+            with open(args.output_file, "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=2)
+
+        if not args.cdp_url and not args.non_interactive:
             input("\nPress Enter to close the browser...")
 
         if not args.cdp_url:
