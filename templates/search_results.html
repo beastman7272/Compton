@@ -1,0 +1,205 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h1>Search Results</h1>
+<p class="muted">Review projects with grouped search-term matches found in uploaded documents.</p>
+
+<div class="filter-bar">
+    <a class="filter-chip {% if active_status_filter == 'exclude_not_pursuing' %}active-filter-chip{% endif %}"
+       href="{{ url_for('search_results') }}">
+        Exclude Not Pursuing
+    </a>
+
+    <a class="filter-chip {% if active_status_filter == 'all' %}active-filter-chip{% endif %}"
+       href="{{ url_for('search_results', status='all') }}">
+        All
+    </a>
+
+    {% for status in statuses %}
+    <a class="filter-chip {% if active_status_filter == status %}active-filter-chip{% endif %}"
+       href="{{ url_for('search_results', status=status) }}">
+        {{ status }}
+    </a>
+    {% endfor %}
+</div>
+
+<div class="card">
+    <div class="table-scroll">
+    <table class="search-results-table">
+        <thead>
+        <tr>
+            <th aria-sort="none">
+                <button class="sort-button" type="button" data-sort-column="0" aria-label="Sort by uploaded date">
+                    Uploaded <span class="sort-indicator" aria-hidden="true"></span>
+                </button>
+            </th>
+            <th>State</th>
+            <th class="project-column">Project</th>
+            <th aria-sort="none">
+                <button class="sort-button" type="button" data-sort-column="3" aria-label="Sort by bid date">
+                    Bid Date <span class="sort-indicator" aria-hidden="true"></span>
+                </button>
+            </th>
+            <th>Search Filter</th>
+            <th class="search-term-column">Search Term</th>
+            <th class="upload-column">Upload</th>
+            <th>Pages</th>
+            <th>Status</th>
+            <th>Category</th>
+        </tr>
+        </thead>
+        <tbody>
+        {% for row in rows %}
+        <tr>
+            <td data-sort-value="{{ row['updated'] or '' }}">{{ row["updated"] }}</td>
+            <td>{{ row["state"] }}</td>
+            <td class="project-column">
+                <a class="truncate-link" href="{{ url_for('project_detail', project_id=row['project_id']) }}">
+                    {{ row["project_name"] }}
+                </a>
+            </td>
+            <td data-sort-value="{{ row['bid_date'] or '' }}">{{ row["bid_date"] or "--" }}</td>
+            <td>
+                {% for filter_option in row["filter_options"] %}
+                <div class="match-summary">{{ filter_option["filter_name"] }}</div>
+                {% endfor %}
+            </td>
+            <td class="search-term-column">
+                {% for term_option in row["term_options"] %}
+                <div class="match-summary">
+                    {{ term_option["term"] }}
+                </div>
+                {% endfor %}
+            </td>
+            <td class="upload-column">
+                {% for upload_option in row["upload_options"] %}
+                <div class="match-summary">
+                    <a class="truncate-link" href="{{ url_for('view_upload', upload_id=upload_option['upload_id']) }}" target="_blank">
+                        {{ upload_option["stored_filename"] }}
+                    </a>
+                </div>
+                {% endfor %}
+            </td>
+            <td>
+                <select class="page-select"
+                        aria-label="Open matched pages for {{ row['project_name'] }}"
+                        onchange="if (this.value) { window.open(this.value, '_blank'); this.selectedIndex = 0; }">
+                    <option value="">Choose term ({{ row["match_count"] }} matches)</option>
+                    {% for term_option in row["term_options"] %}
+                        <option value="{{ url_for(
+                            'view_project_term_highlight',
+                            project_id=row['project_id'],
+                            term=term_option['term']
+                        ) }}">
+                            {{ term_option["term"] }}
+                        </option>
+                    {% endfor %}
+                </select>
+            </td>
+
+            <td><span class="status-pill">{{ row["status"] }}</span></td>
+            <td>
+                <div class="match-summary">{{ row["category"] }}</div>
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    </div>
+</div>
+
+<style>
+    .search-results-table .sort-button {
+        align-items: center;
+        background: none;
+        border: 0;
+        color: inherit;
+        cursor: pointer;
+        display: inline-flex;
+        font: inherit;
+        font-weight: inherit;
+        gap: 4px;
+        padding: 0;
+    }
+
+    .search-results-table .sort-button:hover,
+    .search-results-table .sort-button:focus {
+        color: #111827;
+    }
+
+    .search-results-table .sort-indicator::after {
+        content: "\2195";
+        font-size: 12px;
+    }
+
+    .search-results-table .sort-button[data-sort-direction="asc"] .sort-indicator::after {
+        content: "\2191";
+    }
+
+    .search-results-table .sort-button[data-sort-direction="desc"] .sort-indicator::after {
+        content: "\2193";
+    }
+</style>
+
+<script>
+    const searchResultsTable = document.querySelector(".search-results-table");
+    const sortButtons = Array.from(searchResultsTable.querySelectorAll("[data-sort-column]"));
+
+    function parseSortDate(value) {
+        if (!value) {
+            return null;
+        }
+
+        const timestamp = Date.parse(value);
+        return Number.isNaN(timestamp) ? null : timestamp;
+    }
+
+    function getRowSortValue(row, columnIndex) {
+        return parseSortDate(row.cells[columnIndex].dataset.sortValue);
+    }
+
+    function sortSearchResults(columnIndex, direction) {
+        const tbody = searchResultsTable.tBodies[0];
+        const sortedRows = Array.from(tbody.rows).sort((leftRow, rightRow) => {
+            const leftValue = getRowSortValue(leftRow, columnIndex);
+            const rightValue = getRowSortValue(rightRow, columnIndex);
+
+            if (leftValue === null && rightValue === null) {
+                return 0;
+            }
+
+            if (leftValue === null) {
+                return 1;
+            }
+
+            if (rightValue === null) {
+                return -1;
+            }
+
+            return direction === "asc"
+                ? leftValue - rightValue
+                : rightValue - leftValue;
+        });
+
+        sortedRows.forEach((row) => tbody.appendChild(row));
+    }
+
+    sortButtons.forEach((button) => {
+        button.addEventListener("click", () => {
+            const columnIndex = Number(button.dataset.sortColumn);
+            const currentDirection = button.dataset.sortDirection;
+            const nextDirection = currentDirection === "asc" ? "desc" : "asc";
+
+            sortButtons.forEach((sortButton) => {
+                sortButton.removeAttribute("data-sort-direction");
+                sortButton.closest("th").setAttribute("aria-sort", "none");
+            });
+
+            button.dataset.sortDirection = nextDirection;
+            button.closest("th").setAttribute("aria-sort", nextDirection === "asc" ? "ascending" : "descending");
+
+            sortSearchResults(columnIndex, nextDirection);
+        });
+    });
+</script>
+{% endblock %}

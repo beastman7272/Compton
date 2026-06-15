@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Load Project Manually</h1>
+        <p class="muted">Create a project or attach files to an existing project without using Google Sheets.</p>
+    </div>
+
+    <a class="button-secondary" href="{{ url_for('projects') }}">
+        Back to Projects
+    </a>
+</div>
+
+{% if errors %}
+<div class="alert-error">
+    <strong>Please fix the following:</strong>
+    <ul>
+        {% for error in errors %}
+        <li>{{ error }}</li>
+        {% endfor %}
+    </ul>
+</div>
+{% endif %}
+
+<div class="card form-card">
+    <form method="post" action="{{ url_for('manual_project_load') }}" enctype="multipart/form-data">
+        <div class="form-group">
+            <label for="load-mode">Load Option</label>
+            <select id="load-mode" name="load_mode">
+                <option value="new" {% if form_data["load_mode"] != "existing" %}selected{% endif %}>
+                    Create a new project
+                </option>
+                <option value="existing" {% if form_data["load_mode"] == "existing" %}selected{% endif %}>
+                    Attach files to an existing project
+                </option>
+            </select>
+        </div>
+
+        <div id="existing-project-section" class="form-group">
+            <label for="existing-project-id">Existing Project</label>
+            <select id="existing-project-id" name="existing_project_id">
+                <option value="">Choose a project</option>
+                {% for project in existing_projects %}
+                <option
+                    value="{{ project['id'] }}"
+                    {% if form_data["existing_project_id"]|string == project["id"]|string %}selected{% endif %}
+                >
+                    {{ project["name"] }}{% if project["city"] or project["state"] %} - {{ project["city"] or "" }}{% if project["city"] and project["state"] %}, {% endif %}{{ project["state"] or "" }}{% endif %}
+                </option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <div id="new-project-section">
+            <div class="form-group">
+                <label for="project-name">Project Name</label>
+                <input
+                    id="project-name"
+                    name="project_name"
+                    type="text"
+                    value="{{ form_data['project_name'] }}"
+                    placeholder="Example: Compton Elementary Renovation"
+                >
+            </div>
+
+            <div class="compact-form-grid">
+                <div class="form-group">
+                    <label for="state">State</label>
+                    <input
+                        id="state"
+                        name="state"
+                        type="text"
+                        value="{{ form_data['state'] }}"
+                        placeholder="Example: PA"
+                    >
+                </div>
+
+                <div class="form-group">
+                    <label for="city">City</label>
+                    <input
+                        id="city"
+                        name="city"
+                        type="text"
+                        value="{{ form_data['city'] }}"
+                    >
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label for="address-raw">Address</label>
+                <input
+                    id="address-raw"
+                    name="address_raw"
+                    type="text"
+                    value="{{ form_data['address_raw'] }}"
+                >
+            </div>
+
+            <div class="compact-form-grid">
+                <div class="form-group">
+                    <label for="bid-date">Bid Date</label>
+                    <input
+                        id="bid-date"
+                        name="bid_date"
+                        type="text"
+                        value="{{ form_data['bid_date'] }}"
+                        placeholder="Example: 06/30/2026"
+                    >
+                </div>
+
+                <div class="form-group">
+                    <label for="budget">Budget</label>
+                    <input
+                        id="budget"
+                        name="budget"
+                        type="text"
+                        value="{{ form_data['budget'] }}"
+                    >
+                </div>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label for="project-file">Project Files</label>
+            <input id="project-file" name="project_file" type="file" accept=".pdf,.zip" multiple required>
+            <div class="help-text">
+                Upload one or more PDFs or ZIP files. Use Ctrl or Shift to select multiple files from the same folder. New uploads are indexed immediately; contact extraction runs when both Architect and General Contractor are blank.
+            </div>
+        </div>
+
+        <div class="form-actions">
+            <button type="submit" class="button-primary">Load Project</button>
+            <a class="button-secondary" href="{{ url_for('projects') }}">Cancel</a>
+        </div>
+    </form>
+</div>
+
+<script>
+    const loadMode = document.getElementById("load-mode");
+    const existingProjectSection = document.getElementById("existing-project-section");
+    const newProjectSection = document.getElementById("new-project-section");
+    const projectName = document.getElementById("project-name");
+    const state = document.getElementById("state");
+    const existingProjectId = document.getElementById("existing-project-id");
+
+    function syncManualLoadForm() {
+        const attachingToExisting = loadMode.value === "existing";
+
+        existingProjectSection.hidden = !attachingToExisting;
+        newProjectSection.hidden = attachingToExisting;
+
+        existingProjectId.required = attachingToExisting;
+        projectName.required = !attachingToExisting;
+        state.required = !attachingToExisting;
+    }
+
+    loadMode.addEventListener("change", syncManualLoadForm);
+    syncManualLoadForm();
+</script>
+{% endblock %}

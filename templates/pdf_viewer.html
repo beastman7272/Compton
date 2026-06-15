@@ -1,0 +1,245 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Document Viewer</h1>
+        <p class="muted">
+            {% if documents|length > 1 %}
+                {{ documents|length }} documents
+            {% else %}
+                {{ upload["stored_filename"] }}
+            {% endif %}
+            ·
+            {% if documents|length == 1 and page_numbers|length > 1 %}
+                Pages {{ page_numbers|join(", ") }}
+            {% elif documents|length == 1 %}
+                Page {{ page_number }}
+            {% else %}
+                Matching pages
+            {% endif %}
+            {% if term %} · Highlight: <strong>{{ term }}</strong>{% endif %}
+        </p>
+    </div>
+
+    <a class="button-secondary" href="{{ pdf_url }}" target="_blank">
+        Open Full PDF
+    </a>
+</div>
+
+<div
+    id="pdf-viewer"
+    class="viewer-layout viewer-layout-single"
+    data-pdf-url="{{ pdf_url }}"
+    data-page-number="{{ page_number }}"
+    data-page-numbers='{{ page_numbers|tojson }}'
+    data-documents='{{ documents|tojson }}'
+    data-search-term="{{ term or '' }}"
+>
+    <section class="card pdf-card">
+        <div id="pdf-pages" class="pdf-pages"></div>
+    </section>
+
+    {#
+    <aside class="card context-panel">
+        <h2>Matched Context</h2>
+
+        {% if result %}
+            <p class="muted">Search term: <strong>{{ result["search_term"] }}</strong></p>
+            <div id="context-text" class="context-large">
+                {{ result["context_text"] }}
+            </div>
+        {% else %}
+            <p class="muted">No stored context found for this match.</p>
+        {% endif %}
+    </aside>
+    #}
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs" type="module"></script>
+
+<script type="module">
+    import * as pdfjsLib from "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs";
+
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+        "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
+
+    const viewer = document.getElementById("pdf-viewer");
+    const pdfUrl = viewer.dataset.pdfUrl;
+    const pageNumber = Number.parseInt(viewer.dataset.pageNumber, 10);
+    const pageNumbers = JSON.parse(viewer.dataset.pageNumbers || `[${pageNumber}]`);
+    const documents = JSON.parse(
+        viewer.dataset.documents ||
+        JSON.stringify([
+            {
+                upload: { stored_filename: "" },
+                pdf_url: pdfUrl,
+                page_numbers: pageNumbers
+            }
+        ])
+    );
+    const searchTerm = viewer.dataset.searchTerm;
+
+    function escapeRegExp(value) {
+        return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }
+
+    /*
+    function highlightHtml(text, term) {
+        if (!term) return text;
+
+        const escaped = escapeRegExp(term);
+        const regex = new RegExp(`(${escaped})`, "gi");
+
+        return text.replace(regex, "<mark>$1</mark>");
+    }
+
+    function highlightContextPanel() {
+        const el = document.getElementById("context-text");
+        if (!el || !searchTerm) return;
+
+        const raw = el.textContent;
+        el.innerHTML = highlightHtml(raw, searchTerm);
+    }
+    */
+
+    function highlightTextLayer(container, term) {
+        if (!term) return;
+
+        const regex = new RegExp(escapeRegExp(term), "gi");
+        const walker = document.createTreeWalker(
+            container,
+            NodeFilter.SHOW_TEXT,
+            {
+                acceptNode(node) {
+                    regex.lastIndex = 0;
+                    return regex.test(node.nodeValue)
+                        ? NodeFilter.FILTER_ACCEPT
+                        : NodeFilter.FILTER_REJECT;
+                }
+            }
+        );
+        const nodes = [];
+
+        while (walker.nextNode()) {
+            nodes.push(walker.currentNode);
+        }
+
+        for (const node of nodes) {
+            const fragment = document.createDocumentFragment();
+            let lastIndex = 0;
+
+            node.nodeValue.replace(regex, (match, offset) => {
+                fragment.appendChild(
+                    document.createTextNode(node.nodeValue.slice(lastIndex, offset))
+                );
+
+                const mark = document.createElement("mark");
+                mark.className = "pdf-highlight";
+                mark.textContent = match;
+                fragment.appendChild(mark);
+
+                lastIndex = offset + match.length;
+                return match;
+            });
+
+            fragment.appendChild(document.createTextNode(node.nodeValue.slice(lastIndex)));
+            node.replaceWith(fragment);
+        }
+    }
+
+    async function renderTextLayer(page, viewport, container) {
+        const textContent = await page.getTextContent();
+
+        container.innerHTML = "";
+        container.style.width = `${viewport.width}px`;
+        container.style.height = `${viewport.height}px`;
+        container.style.setProperty("--scale-factor", viewport.scale);
+
+        if (pdfjsLib.TextLayer) {
+            const textLayer = new pdfjsLib.TextLayer({
+                textContentSource: textContent,
+                container,
+                viewport
+            });
+            await textLayer.render();
+            return;
+        }
+
+        const renderTask = pdfjsLib.renderTextLayer({
+            textContentSource: textContent,
+            container,
+            viewport
+        });
+        await renderTask.promise;
+    }
+
+    async function renderPdfPage(pdf, targetPageNumber, pagesContainer, storedFilename) {
+        const page = await pdf.getPage(targetPageNumber);
+
+        const pageWrapper = document.createElement("div");
+        pageWrapper.className = "pdf-page-wrapper";
+
+        const pageLabel = document.createElement("div");
+        pageLabel.className = "pdf-page-label";
+        pageLabel.textContent = storedFilename
+            ? `${storedFilename} - Page ${targetPageNumber}`
+            : `Page ${targetPageNumber}`;
+
+        const pageContainer = document.createElement("div");
+        pageContainer.className = "pdf-page";
+
+        const canvas = document.createElement("canvas");
+        canvas.className = "pdf-canvas";
+
+        const textLayer = document.createElement("div");
+        textLayer.className = "text-layer";
+
+        pageContainer.appendChild(canvas);
+        pageContainer.appendChild(textLayer);
+        pageWrapper.appendChild(pageLabel);
+        pageWrapper.appendChild(pageContainer);
+        pagesContainer.appendChild(pageWrapper);
+
+        const scale = 1.4;
+        const viewport = page.getViewport({ scale });
+
+        const context = canvas.getContext("2d");
+
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        pageContainer.style.width = `${viewport.width}px`;
+        pageContainer.style.height = `${viewport.height}px`;
+
+        await page.render({
+            canvasContext: context,
+            viewport
+        }).promise;
+
+        await renderTextLayer(page, viewport, textLayer);
+        highlightTextLayer(textLayer, searchTerm);
+    }
+
+    async function renderPdfPages() {
+        const pagesContainer = document.getElementById("pdf-pages");
+
+        for (const documentInfo of documents) {
+            const loadingTask = pdfjsLib.getDocument(documentInfo.pdf_url);
+            const pdf = await loadingTask.promise;
+            const storedFilename = documentInfo.upload?.stored_filename || "";
+
+            for (const targetPageNumber of documentInfo.page_numbers) {
+                await renderPdfPage(
+                    pdf,
+                    targetPageNumber,
+                    pagesContainer,
+                    storedFilename
+                );
+            }
+        }
+    }
+
+    // highlightContextPanel();
+    renderPdfPages();
+</script>
+{% endblock %}

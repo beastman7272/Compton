@@ -1,0 +1,150 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h1>{{ project["name"] }}</h1>
+<p class="muted">{{ project["city"] or "" }}{% if project["city"] and project["state"] %}, {% endif %}{{ project["state"] or "" }}</p>
+
+{% set architect = selected_contacts["Architect"] %}
+{% set general_contractor = selected_contacts["General Contractor"] %}
+
+<section class="card">
+    <h2>Project Information</h2>
+    <dl>
+        <dt>Status</dt>
+        <dd>
+            <form method="post" action="{{ url_for('update_project_status', project_id=project['id']) }}" class="inline-form">
+                <input type="hidden" name="next" value="{{ request.path }}">
+                <select name="status">
+                    {% for status in statuses %}
+                    <option value="{{ status }}" {% if project["status"] == status %}selected{% endif %}>
+                        {{ status }}
+                    </option>
+                    {% endfor %}
+                </select>
+                <button type="submit">Update</button>
+            </form>
+        </dd>
+        <dt>Bid Date</dt><dd>{{ project["bid_date"] or "--" }}</dd>
+        <dt>Budget</dt><dd>{{ project["budget"] or "--" }}</dd>
+        <dt>Address</dt><dd>{{ project["address_raw"] or "--" }}</dd>
+        <dt>Source</dt>
+        <dd>
+            {{ project["source_system"] }}{% if project["source_system"] == "ConstructConnect" and project["source_project_id"] %} - {{ project["source_project_id"] }}{% endif %}
+        </dd>
+    </dl>
+</section>
+
+<div class="contact-grid">
+    <section class="card contact-card">
+        <h2>Architect</h2>
+        <form method="post" action="{{ url_for('update_project_contact', project_id=project['id'], contact_type_key='architect') }}">
+            <div class="compact-form-grid">
+                <div class="form-group full-width">
+                    <label for="architect-organization">Organization</label>
+                    <input id="architect-organization" name="organization" type="text" value="{{ architect['organization'] or '' }}">
+                </div>
+                <div class="form-group">
+                    <label for="architect-name">Name</label>
+                    <input id="architect-name" name="contact_name" type="text" value="{{ architect['contact_name'] or '' }}">
+                </div>
+                <div class="form-group">
+                    <label for="architect-phone">Phone</label>
+                    <input id="architect-phone" name="phone" type="text" value="{{ architect['phone'] or '' }}">
+                </div>
+                <div class="form-group">
+                    <label for="architect-email">Email</label>
+                    <input id="architect-email" name="email" type="email" value="{{ architect['email'] or '' }}">
+                </div>
+            </div>
+            <div class="form-actions">
+                <button type="submit" class="button-primary">Save Architect</button>
+                {% if architect["source_upload_id"] %}
+                <span class="help-text">Extracted from page {{ architect["source_page_number"] or "--" }}</span>
+                {% elif architect["id"] %}
+                <span class="help-text">Manual entry</span>
+                {% endif %}
+            </div>
+        </form>
+    </section>
+
+    <section class="card contact-card">
+        <h2>General Contractor</h2>
+        <form method="post" action="{{ url_for('update_project_contact', project_id=project['id'], contact_type_key='general-contractor') }}">
+            <div class="compact-form-grid">
+                <div class="form-group full-width">
+                    <label for="gc-organization">Organization</label>
+                    <input id="gc-organization" name="organization" type="text" value="{{ general_contractor['organization'] or '' }}">
+                </div>
+                <div class="form-group">
+                    <label for="gc-name">Name</label>
+                    <input id="gc-name" name="contact_name" type="text" value="{{ general_contractor['contact_name'] or '' }}">
+                </div>
+                <div class="form-group">
+                    <label for="gc-phone">Phone</label>
+                    <input id="gc-phone" name="phone" type="text" value="{{ general_contractor['phone'] or '' }}">
+                </div>
+                <div class="form-group">
+                    <label for="gc-email">Email</label>
+                    <input id="gc-email" name="email" type="email" value="{{ general_contractor['email'] or '' }}">
+                </div>
+            </div>
+            <div class="form-actions">
+                <button type="submit" class="button-primary">Save General Contractor</button>
+                {% if general_contractor["source_upload_id"] %}
+                <span class="help-text">Extracted from page {{ general_contractor["source_page_number"] or "--" }}</span>
+                {% elif general_contractor["id"] %}
+                <span class="help-text">Manual entry</span>
+                {% endif %}
+            </div>
+        </form>
+    </section>
+</div>
+
+<section class="card">
+    <h2>Uploads</h2>
+    <table>
+        <thead>
+        <tr>
+            <th>File</th>
+            <th>Status</th>
+            <th>Pages</th>
+            <th>Created</th>
+        </tr>
+        </thead>
+        <tbody>
+        {% for upload in uploads %}
+        <tr>
+            <td>
+                <a href="{{ url_for('view_upload', upload_id=upload['id']) }}" target="_blank">
+                    {{ upload["stored_filename"] }}
+                </a>
+                <div class="muted">
+                    <a href="{{ url_for('download_upload', upload_id=upload['id']) }}">
+                        Download
+                    </a>
+                </div>
+            </td>
+            <td>{{ upload["upload_status"] }}</td>
+            <td>{{ upload["page_count"] or "--" }}</td>
+            <td>{{ upload["created_at"] }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<section class="card">
+    <h2>Search Matches</h2>
+    {% if matches %}
+        {% for match in matches %}
+        <div class="match-row">
+            <strong>{{ match["category"] }} / {{ match["filter_name"] }}</strong>
+            <span class="muted"> · {{ match["term"] }} · page {{ match["page_number"] }}</span>
+            <div class="context">{{ match["context_text"] }}</div>
+        </div>
+        {% endfor %}
+    {% else %}
+        <p class="muted">No matches found.</p>
+    {% endif %}
+</section>
+{% endblock %}

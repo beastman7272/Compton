@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Search Filters</h1>
+        <p class="muted">Manage saved search filters and terms used to find project matches.</p>
+    </div>
+
+    <a class="button-primary" href="{{ url_for('create_search_filter') }}">
+        New Search Filter
+    </a>
+</div>
+
+<div class="card">
+    <table>
+        <thead>
+        <tr>
+            <th>Filter Name</th>
+            <th>Category</th>
+            <th>Search Terms</th>
+            <th>Status</th>
+            <th>Actions</th>
+        </tr>
+        </thead>
+        <tbody>
+        {% for row in rows %}
+        <tr>
+            <td><strong>{{ row["name"] }}</strong></td>
+            <td>{{ row["category"] }}</td>
+            <td>
+                {% if row["terms"] %}
+                    {{ row["terms"] }}
+                {% else %}
+                    <span class="muted">No terms</span>
+                {% endif %}
+            </td>
+            <td>
+                {% if row["is_active"] %}
+                    <span class="status-pill">Active</span>
+                {% else %}
+                    <span class="status-pill">Inactive</span>
+                {% endif %}
+            </td>
+            <td class="actions-cell">
+                <a href="{{ url_for('edit_search_filter', filter_id=row['id']) }}">Edit</a>
+                <span class="muted">·</span>
+                <form method="post"
+                    action="{{ url_for('delete_search_filter', filter_id=row['id']) }}"
+                    class="inline-delete-form"
+                    onsubmit="return confirm('Delete this search filter? This will also delete its terms and existing search results.');">
+                    <button type="submit" class="link-button danger-link">Delete</button>
+                </form>
+            </td>
+        </tr>
+        {% else %}
+        <tr>
+            <td colspan="5" class="muted">No search filters yet.</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

@@ -1,0 +1,92 @@
+TASK: Process BuildingConnected projects — BROWSER NAVIGATION ONLY
+All Google Sheets updates have already been handled. You only need to:
+  1. Navigate to each project on BuildingConnected
+  2. Collect project details (Location, Project Size, Due Date)
+  3. Download eligible files from the Files tab
+  4. Report results in the structured format below
+
+GLOBAL FILE RULES (apply to ALL projects below):
+  Skip FOLDERS with these words in their name: [assessment, budget, cad, drawings, drws, dwgs, geotech, geo-tech, geotechnical, manual, narrative, pay request, permit, photos, pricing, procedure, purchase order]
+    EXCEPTION: If the folder name ALSO contains any of [plans, specifications, specs],
+    then OPEN the folder anyway (e.g. "Drawings & Specifications" → open it).
+  Skip FILES with these words in their name: [assessment, budget, cad, drawings, drws, dwgs, geotech, geo-tech, geotechnical, manual, narrative, pay request, permit, photos, pricing, procedure, purchase order, affidavit, air conditioner, assessment, budget, certification, civil, communications, conditions, concrete, conductors, control, controls, conveying systems, drainage, drawing, ductwork, earthwork, electrical, electronic, engine, equipment, erosion, fittings, fixtures, fuses, generator, geotech, geotechnical, grounding, heat pump, hvac, insurance, instructions, landscape, lighting, lightning, masonry, mechanical, metals, motor, outlet, outlets, paint, pavement, photo, photos, piping, plans, plumbing, power, procurement, questionnaire, requirements, refrigerant, retail, revisions, sample standard, sanitary, seals, sedimentation, seismic, sewage, specialties, stormwater, structural, surge, terms, testing, utilities.pdf, ventilator, vibration, voice, windows, wiring, wood & plastics]
+
+STARTING POINT: https://app.buildingconnected.com/opportunities/pipeline
+Use the 'Undecided' tab. Do NOT use the Find button. Do NOT go to Archived.
+
+TRUNCATION / PARTIAL MATCH RULE:
+  BuildingConnected may truncate long project names in the Bid Board row. Do not require the full target name to be visible in the row.
+
+  A row counts as a LIKELY MATCH if the visible project name contains the distinctive core words from the target project name, even if the end is cut off with '...'.
+
+  For each LIKELY MATCH:
+    1. Open the project row.
+    2. Check the full project name on the project detail page.
+    3. Treat the project as FOUND if the full name is an exact match or an obvious variant of the target project.
+    4. If it is not the correct project, return to the Undecided Bid Board and continue scanning.
+
+  Example:
+    - Target: 'Tower Renovation - Louisville, KY'
+      Visible row: 'Tower Renovation...'
+      Action: Open and verify if location/client/details suggest the same project.
+
+  Do NOT mark a project NOT FOUND just because the visible row text is truncated.
+
+PROJECT SEARCH RULES:
+  1. Work only in the Undecided tab.
+  2. Do NOT use Find/Search.
+  3. Sort projects in the Undecided tab by Name.
+  4. SORT OPTIMIZATION: Sort by Name ascending once, then scan top-to-bottom. Do NOT toggle between ascending and descending — pick one direction and complete the full scan before trying the other.
+  5. Read every visible row before each scroll.
+  6. LAZY-LOAD RULE: Before scrolling, use read_page or get_page_text to check whether the target already appears in the loaded DOM. Scroll only if the target is not present and more rows might exist below the current viewport.
+  7. After each scroll, wait for the list to finish loading, then continue scanning every visible row.
+  8. Continue until you either find the target project (note the Truncation / Partial Match Rule) or reach the end of the Undecided list.
+  9. STOPPING RULE: If the visible project names on the current page have all passed alphabetically beyond the target (e.g., you're on 'D' names and the target starts with 'C'), go to the next page. If you've reached the end of the list without finding a match, report NOT FOUND — do NOT re-scan in the opposite sort direction.
+  10. MULTIPLE MATCHES: When multiple rows share the same core words, prefer the row whose visible name contains words that also appear in the target's distinctive parts (e.g., 'TI Montgomery' → pick the 'TI' row, not the '(Eastchase)' row).
+  11. Do NOT report NOT FOUND unless you have completed a full top-to-bottom scan of the entire Undecided list.
+
+  DO NOT STOP TO ASK FOR PERMISSION OR CONFIRMATION! You must operate unattended.
+
+PROCESS THESE 2 PROJECT(S) IN ORDER:
+============================================================
+
+PROJECT 1/2: Spencer's 2294 Elizabethtown, KY
+----------------------------------------
+Action: Find project → note details → download files
+Steps:
+  1. Find "Spencer's 2294 Elizabethtown, KY" in the Undecided tab
+  2. Note the Location, Project Size, and Due Date
+  3. Go to the Files tab
+  4. Open all folders EXCEPT those matching the folder skip list above
+     (but DO open folders that also contain Plans/Specifications/Specs)
+  5. Select all files EXCEPT those matching the file skip list above
+  6. Click Download Selected, wait 60 seconds
+
+
+PROJECT 2/2: Boys & Girls Club REBID - Copperhill, TN
+----------------------------------------
+Action: Find project → note details → download files
+Steps:
+  1. Find "Boys & Girls Club REBID - Copperhill, TN" in the Undecided tab
+  2. Note the Location, Project Size, and Due Date
+  3. Go to the Files tab
+  4. Open all folders EXCEPT those matching the folder skip list above
+     (but DO open folders that also contain Plans/Specifications/Specs)
+  5. Select all files EXCEPT those matching the file skip list above
+  6. Click Download Selected, wait 60 seconds
+
+============================================================
+REPORT FORMAT — Reply with this EXACT structure for each project:
+
+---PROJECT RESULT---
+Project: [exact project name]
+Status: [FOUND / NOT FOUND]
+Location: [location from project page]
+Project Size: [size from project page]
+Due Date: [MM/DD/YYYY from project page — date only, e.g. 04/28/2026]
+Files Downloaded:
+  - [filename1]
+  - [filename2]
+---END PROJECT---
+
+If a project is NOT FOUND, still report it with Status: NOT FOUND

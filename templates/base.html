@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Compton CQE</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+<div class="layout">
+    <aside class="sidebar">
+        <div class="logo">
+            <div class="logo-bars">
+                <span></span><span></span><span></span><span></span>
+            </div>
+            <div>
+                <div class="logo-title">Compton</div>
+                <div class="logo-subtitle">RepScan</div>
+            </div>
+        </div>
+
+        <nav>
+            <a href="{{ url_for('dashboard') }}">Dashboard</a>
+            <a href="{{ url_for('search_results') }}">Search Results</a>
+            <a href="{{ url_for('projects') }}">Projects</a>
+            <a href="{{ url_for('search_filters') }}">Search Filters</a>
+        </nav>
+    </aside>
+
+    <main class="content">
+        {% block content %}{% endblock %}
+    </main>
+</div>
+</body>
+</html>

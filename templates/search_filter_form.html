@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>{{ title }}</h1>
+        <p class="muted">Define search terms used to identify relevant project document matches.</p>
+    </div>
+
+    <a class="button-secondary" href="{{ url_for('search_filters') }}">
+        Back to Search Filters
+    </a>
+</div>
+
+{% if errors %}
+<div class="alert-error">
+    <strong>Please fix the following:</strong>
+    <ul>
+        {% for error in errors %}
+        <li>{{ error }}</li>
+        {% endfor %}
+    </ul>
+</div>
+{% endif %}
+
+<div class="card form-card">
+    <form method="post" action="{{ action_url }}">
+        <div class="form-group">
+            <label for="name">Filter Name</label>
+            <input
+                id="name"
+                name="name"
+                type="text"
+                value="{{ name }}"
+                required
+                placeholder="Example: Fencing"
+            >
+        </div>
+
+        <div class="form-group">
+            <label for="category">Category</label>
+            <input
+                id="category"
+                name="category"
+                type="text"
+                value="{{ category }}"
+                required
+                placeholder="Example: Sitework"
+            >
+            <div class="help-text">For V1, enter an existing or new category name.</div>
+        </div>
+
+        <div class="form-group">
+            <label for="terms">Search Terms</label>
+            <textarea
+                id="terms"
+                name="terms"
+                rows="8"
+                required
+                placeholder="Enter one term per line, or separate terms with commas."
+            >{{ terms_text }}</textarea>
+            <div class="help-text">
+                Matching is case-insensitive and supports words or phrases.
+            </div>
+        </div>
+
+        <div class="form-group checkbox-group">
+            <label>
+                <input
+                    type="checkbox"
+                    name="is_active"
+                    value="1"
+                    {% if mode == "create" or is_active %}checked{% endif %}
+                >
+                Active filter
+            </label>
+            <div class="help-text">
+                Active filters are applied when documents are indexed.
+            </div>
+        </div>
+
+        <div class="form-actions">
+            <button type="submit" class="button-primary">
+                {% if mode == "create" %}Create Filter{% else %}Update Filter{% endif %}
+            </button>
+
+            <a class="button-secondary" href="{{ url_for('search_filters') }}">
+                Cancel
+            </a>
+        </div>
+    </form>
+</div>
+{% endblock %}

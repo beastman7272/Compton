@@ -1,0 +1,12 @@
+google-api-python-client>=2.0.0
+google-auth
+google-auth-httplib2>=0.1.0
+google-auth-oauthlib>=0.4.0
+python-dotenv
+playwright
+pandas
+xlrd
+openpyxl
+pymupdf
+openai
+flask

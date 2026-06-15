@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Projects</h1>
+        <p class="muted">View imported and manually created projects.</p>
+    </div>
+
+    <a class="button-primary" href="{{ url_for('manual_project_load') }}">
+        Load Project Manually
+    </a>
+</div>
+
+<div class="card">
+    <form id="project-delete-form" method="post" action="{{ url_for('delete_projects') }}">
+        <div class="table-toolbar">
+            <button id="delete-selected-button" class="button-danger" type="submit" disabled>
+                Delete Selected
+            </button>
+            <span id="selected-count" class="muted" hidden></span>
+        </div>
+
+    <table>
+        <thead>
+        <tr>
+            <th>Last Updated</th>
+            <th>State</th>
+            <th>Project Name</th>
+            <th>Bid Date</th>
+            <th>Budget</th>
+            <th>Uploads</th>
+            <th>Status</th>
+            <th class="select-cell">Delete</th>
+        </tr>
+        </thead>
+        <tbody>
+        {% for row in rows %}
+        <tr>
+            <td>{{ row["updated_at"] }}</td>
+            <td>{{ row["state"] }}</td>
+            <td>
+                <a href="{{ url_for('project_detail', project_id=row['id']) }}">
+                    {{ row["name"] }}
+                </a>
+            </td>
+            <td>{{ row["bid_date"] }}</td>
+            <td>{{ row["budget"] }}</td>
+            <td>{{ row["upload_count"] }}</td>
+            <td><span class="status-pill">{{ row["status"] }}</span></td>
+            <td class="select-cell">
+                <input
+                    type="checkbox"
+                    name="project_ids"
+                    value="{{ row['id'] }}"
+                    aria-label="Select {{ row['name'] }} for deletion"
+                >
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    </form>
+</div>
+
+<script>
+    const deleteForm = document.getElementById("project-delete-form");
+    const deleteButton = document.getElementById("delete-selected-button");
+    const selectedCount = document.getElementById("selected-count");
+    const projectCheckboxes = Array.from(deleteForm.querySelectorAll("input[name='project_ids']"));
+
+    function updateDeleteControls() {
+        const checkedCount = projectCheckboxes.filter((checkbox) => checkbox.checked).length;
+
+        deleteButton.disabled = checkedCount === 0;
+        selectedCount.hidden = checkedCount === 0;
+        selectedCount.textContent = checkedCount === 1
+            ? "1 project selected"
+            : `${checkedCount} projects selected`;
+    }
+
+    projectCheckboxes.forEach((checkbox) => {
+        checkbox.addEventListener("change", updateDeleteControls);
+    });
+
+    deleteForm.addEventListener("submit", (event) => {
+        const checkedCount = projectCheckboxes.filter((checkbox) => checkbox.checked).length;
+        const projectText = checkedCount === 1 ? "project" : "projects";
+
+        if (!window.confirm(`Permanently delete ${checkedCount} selected ${projectText}?`)) {
+            event.preventDefault();
+        }
+    });
+
+    updateDeleteControls();
+</script>
+{% endblock %}

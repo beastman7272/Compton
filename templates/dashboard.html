@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h1>Dashboard</h1>
+<p class="muted">Review projects and related document matches.</p>
+
+<div class="status-grid">
+    <a class="status-card status-link {% if not active_status %}active-status-card{% endif %}"
+       href="{{ url_for('dashboard') }}">
+        <div class="status-count">{{ total_project_count }}</div>
+        <div class="status-label">All Projects</div>
+    </a>
+
+    {% for row in status_rows %}
+    <a class="status-card status-link {% if active_status == row['status'] %}active-status-card{% endif %}"
+       href="{{ url_for('dashboard', status=row['status']) }}">
+        <div class="status-count">{{ row["count"] }}</div>
+        <div class="status-label">{{ row["status"] }}</div>
+    </a>
+    {% endfor %}
+</div>
+
+<div class="card">
+    <h2>
+        Project Review Queue
+        {% if active_status %}
+            <span class="muted">— {{ active_status }}</span>
+        {% endif %}
+    </h2>
+
+    {% for project in projects %}
+    <div class="project-group">
+        <div class="project-row">
+            <div>
+                <strong>
+                    <a href="{{ url_for('project_detail', project_id=project['id']) }}">
+                        {{ project["name"] }}
+                    </a>
+                </strong>
+                <div class="muted">
+                    {{ project["city"] or "" }}{% if project["city"] and project["state"] %}, {% endif %}{{ project["state"] or "" }}
+                    · Uploads: {{ project["upload_count"] }}
+                    · Matches: {{ project["match_count"] }}
+                </div>
+            </div>
+        
+            <form method="post"
+                  action="{{ url_for('update_project_status', project_id=project['id']) }}"
+                  class="inline-form dashboard-status-form">
+                <input type="hidden" name="next" value="{{ request.full_path }}">
+                <select name="status">
+                    {% for status in statuses %}
+                    <option value="{{ status }}" {% if project["status"] == status %}selected{% endif %}>
+                        {{ status }}
+                    </option>
+                    {% endfor %}
+                </select>
+                <button type="submit">Update</button>
+            </form>
+        </div>
+
+        {% set matches = matches_by_project.get(project["id"], []) %}
+        {% if matches %}
+            <div class="match-list">
+                {% for match in matches %}
+                <div class="match-row">
+                    <div>
+                        <strong>{{ match["category"] }} / {{ match["filter_name"] }}</strong>
+                        <span class="muted"> · {{ match["term"] }} · {{ match["stored_filename"] }}</span>
+                        <div class="match-pages">
+                            Pages:
+                            {% for page in match["pages"] %}
+                            <a href="{{ url_for(
+                                'view_upload_page_highlight',
+                                upload_id=match['upload_id'],
+                                page_number=page['page_number'],
+                                term=match['term'],
+                                result_id=page['result_id']
+                            ) }}" target="_blank">
+                                {{ page["page_number"] }}
+                            </a>{% if not loop.last %}, {% endif %}
+                            {% endfor %}
+                        </div>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        {% else %}
+            <div class="muted small-pad">No search matches.</div>
+        {% endif %}
+    </div>
+    {% endfor %}
+</div>
+{% endblock %}
