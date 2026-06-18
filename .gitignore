@@ -28,3 +28,6 @@ orchestrator_token.json
 
 # Ignore playwright results
 playwright_results.json
+
+# Ignore generated workflow logs
+logs/

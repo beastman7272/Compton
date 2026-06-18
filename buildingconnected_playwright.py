@@ -22,6 +22,10 @@ LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled", "--start-maximiz
 NAV_TIMEOUT_MS = 120_000
 DOWNLOAD_TIMEOUT_MS = 180_000
 LOG_ENABLED = True
+LOGIN_REQUIRED_MESSAGE = (
+    "BuildingConnected login/MFA required. Open the Playwright browser profile, "
+    "complete Autodesk login, then rerun the scheduled workflow."
+)
 SKIP_FOLDER_KEYWORDS = [
     "assessment", "budget", "cad", "drawings", "drws", "dwgs", "geotech", "geo-tech",
     "geotechnical", "manual", "narrative", "pay request", "permit", "photos", "pricing",
@@ -65,6 +69,10 @@ class BidRow:
     href: str
     x: float
     y: float
+
+
+class BuildingConnectedLoginRequired(RuntimeError):
+    """Raised when the persistent browser profile needs a fresh Autodesk login."""
 
 
 def log(message: str) -> None:
@@ -112,6 +120,29 @@ def pause_for_user(reason: str) -> None:
     input("Fix/confirm the browser state, then press Enter to continue...")
 
 
+def looks_like_login_page(page: Page) -> bool:
+    current_url = (page.url or "").lower()
+    login_markers = (
+        "login.autodesk.com",
+        "signin",
+        "sign-in",
+        "oauth",
+        "authorize",
+        "authentication",
+    )
+    if any(marker in current_url for marker in login_markers):
+        return True
+
+    try:
+        title = page.title().lower()
+    except Exception:
+        title = ""
+
+    return "autodesk" in title and any(
+        marker in title for marker in ("sign in", "login", "verify", "authentication")
+    )
+
+
 def click_text_if_visible(page: Page, text: str, timeout: int = 8_000) -> bool:
     try:
         locator = page.get_by_text(text, exact=False).first
@@ -128,10 +159,15 @@ def open_pipeline(page: Page, *, non_interactive: bool = False) -> None:
         page.goto(START_URL, wait_until="commit", timeout=NAV_TIMEOUT_MS)
     except PlaywrightTimeoutError:
         if non_interactive:
-            raise RuntimeError("Timed out opening BuildingConnected; login/MFA may be required.")
+            raise BuildingConnectedLoginRequired(LOGIN_REQUIRED_MESSAGE)
         pause_for_user("Timed out opening BuildingConnected. The browser may be waiting on Autodesk login.")
 
     page.wait_for_timeout(3_000)
+
+    if looks_like_login_page(page):
+        if non_interactive:
+            raise BuildingConnectedLoginRequired(LOGIN_REQUIRED_MESSAGE)
+        pause_for_user(LOGIN_REQUIRED_MESSAGE)
 
 
 def ensure_pipeline(page: Page, *, non_interactive: bool = False) -> None:
@@ -139,8 +175,18 @@ def ensure_pipeline(page: Page, *, non_interactive: bool = False) -> None:
     open_pipeline(page, non_interactive=non_interactive)
 
     if not click_text_if_visible(page, "Undecided", timeout=12_000):
+        if looks_like_login_page(page):
+            if non_interactive:
+                raise BuildingConnectedLoginRequired(LOGIN_REQUIRED_MESSAGE)
+            pause_for_user(LOGIN_REQUIRED_MESSAGE)
+            open_pipeline(page, non_interactive=non_interactive)
+            if click_text_if_visible(page, "Undecided", timeout=12_000):
+                return
         if non_interactive:
-            raise RuntimeError("Could not click the Undecided tab; login/MFA may be required.")
+            raise RuntimeError(
+                "Could not reach the BuildingConnected Undecided tab. "
+                "Login/MFA may be required, or the Bid Board UI may have changed."
+            )
         pause_for_user("Could not click the Undecided tab. Login/MFA may be required.")
         open_pipeline(page, non_interactive=non_interactive)
         if not click_text_if_visible(page, "Undecided", timeout=12_000):
@@ -1382,6 +1428,12 @@ def process_project(
                 for kind, action, name, reason in classified_file_items(page)
             ]
 
+        return result
+    except BuildingConnectedLoginRequired as exc:
+        result["status"] = "ERROR"
+        result["url"] = page.url
+        result["error"] = str(exc)
+        result["login_required"] = True
         return result
     except Exception as exc:
         result["status"] = "ERROR"

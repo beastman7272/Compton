@@ -1,28 +1,47 @@
 from __future__ import annotations
 
+import argparse
+import os
 import re
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from dotenv import load_dotenv
 from playwright.sync_api import Download, Locator, Page, sync_playwright
 
 SPREADSHEET_ID = "1vqEd71BGHNMDJdBcymM4cgGzEQhlXsib3sFXY9Qlt7U"
-TAB_NAME = "Fortress"
 CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE = "token.json"
 
 SEARCH_URL = "https://insight.cmdgroup.com/SearchResult/ProjectSearchResult/Index"
 DOWNLOAD_DIR = Path.home() / "Downloads"
 HEADLESS = False
+PROFILE_DIR = Path("playwright_cc_profile")
+LOGIN_REQUIRED_MESSAGE = (
+    "ConstructConnect login required. Open the Playwright browser profile, "
+    "log in to ConstructConnect, or configure CONSTRUCTCONNECT_USERNAME and "
+    "CONSTRUCTCONNECT_PASSWORD, then rerun the workflow."
+)
 EXPORT_CLEANUP_ATTEMPTS = 3
 EXPORT_CLEANUP_WAIT_MS = 5000
 MENU_CLICK_TIMEOUT_MS = 60000
 DOWNLOAD_TIMEOUT_MS = 120000
 EXPORT_WAIT_TIMEOUT_MS = 90000
+
+MANUFACTURER_DAYS = {
+    "Citadel": {"monday"},
+    "Fortress": {"tuesday", "sunday"},
+    "Fabral": {"wednesday", "saturday"},
+    "Metal-Era": {"thursday"},
+}
+WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -32,6 +51,7 @@ SCOPES = [
 
 @dataclass
 class Project:
+    tab_name: str
     row_number: int
     project_id: str
     title: str
@@ -53,6 +73,10 @@ def log(step: str) -> None:
     print(f"[STEP] {step}")
 
 
+class ConstructConnectLoginRequired(RuntimeError):
+    """Raised when the persistent browser profile needs a fresh ConstructConnect login."""
+
+
 def get_creds() -> Credentials:
     creds = None
 
@@ -61,13 +85,17 @@ def get_creds() -> Credentials:
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except RefreshError:
+                Path(TOKEN_FILE).unlink(missing_ok=True)
+                creds = None
+
+        if not creds or not creds.valid:
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
 
-        with open(TOKEN_FILE, "w", encoding="utf-8") as token:
-            token.write(creds.to_json())
+        Path(TOKEN_FILE).write_text(creds.to_json(), encoding="utf-8")
 
     return creds
 
@@ -83,19 +111,32 @@ def get_sheets_service():
     return build("sheets", "v4", credentials=creds)
 
 
-def fetch_projects() -> list[Project]:
-    sheets_service = get_sheets_service()
+def sheet_range(tab_name: str, range_name: str) -> str:
+    escaped_tab_name = tab_name.replace("'", "''")
+    return f"'{escaped_tab_name}'!{range_name}"
+
+
+def scheduled_manufacturers(run_day: str) -> list[str]:
+    return [
+        manufacturer
+        for manufacturer, days in MANUFACTURER_DAYS.items()
+        if run_day in days
+    ]
+
+
+def fetch_projects(sheets_service, tab_name: str) -> list[Project]:
     result = (
         sheets_service.spreadsheets()
         .values()
-        .get(spreadsheetId=SPREADSHEET_ID, range=f"{TAB_NAME}!A:L")
+        .get(spreadsheetId=SPREADSHEET_ID, range=sheet_range(tab_name, "A:L"))
         .execute()
     )
 
     values = result.get("values", [])
     
     if len(values) < 2:
-        raise RuntimeError(f"No project rows found in tab '{TAB_NAME}'.")
+        print(f"No project rows found in tab '{tab_name}'.")
+        return []
 
     rows = values[1:]
     projects: list[Project] = []
@@ -112,6 +153,7 @@ def fetch_projects() -> list[Project]:
             continue
 
         project = Project(
+            tab_name=tab_name,
             row_number=idx,
             project_id=clean(padded[0]),
             title=clean(padded[1]),
@@ -146,17 +188,146 @@ def wait_visible(page: Page, selector: str, timeout: int = 60000) -> Locator:
     return locator
 
 
-def wait_for_manual_login(page: Page) -> None:
+def has_search_ui(page: Page) -> bool:
+    try:
+        search_input = page.locator("#demo-input-local").first
+        return search_input.count() > 0 and search_input.is_visible()
+    except Exception:
+        return False
+
+
+def looks_like_login_page(page: Page) -> bool:
+    current_url = (page.url or "").lower()
+    if any(marker in current_url for marker in ("login", "signin", "sign-in", "account")):
+        return True
+
+    try:
+        title = page.title().lower()
+    except Exception:
+        title = ""
+
+    if any(marker in title for marker in ("login", "sign in", "constructconnect")):
+        try:
+            password_fields = page.locator('input[type="password"]').count()
+            email_fields = page.locator('input[type="email"], input[name*="email" i]').count()
+            return password_fields > 0 or email_fields > 0
+        except Exception:
+            return True
+
+    return False
+
+
+def first_configured_env(*names: str) -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value.strip()
+    return ""
+
+
+def constructconnect_credentials() -> tuple[str, str]:
+    username = first_configured_env(
+        "CONSTRUCTCONNECT_USERNAME",
+        "CONSTRUCTCONNECT_EMAIL",
+        "CC_USERNAME",
+        "CC_EMAIL",
+    )
+    password = first_configured_env(
+        "CONSTRUCTCONNECT_PASSWORD",
+        "CC_PASSWORD",
+    )
+    return username, password
+
+
+def first_visible_locator(page: Page, selectors: list[str], timeout: int = 2000) -> Locator | None:
+    for selector in selectors:
+        locator = page.locator(selector).first
+        try:
+            locator.wait_for(state="visible", timeout=timeout)
+            return locator
+        except Exception:
+            continue
+    return None
+
+
+def click_first_visible(page: Page, selectors: list[str], timeout: int = 3000) -> bool:
+    locator = first_visible_locator(page, selectors, timeout=timeout)
+    if not locator:
+        return False
+    locator.click()
+    page.wait_for_timeout(1500)
+    return True
+
+
+def attempt_constructconnect_login(page: Page) -> None:
+    username, password = constructconnect_credentials()
+    if not username or not password:
+        raise ConstructConnectLoginRequired(LOGIN_REQUIRED_MESSAGE)
+
+    username_selectors = [
+        'input[type="email"]',
+        'input[name*="email" i]',
+        'input[id*="email" i]',
+        'input[name*="user" i]',
+        'input[id*="user" i]',
+        'input[placeholder*="email" i]',
+        'input[placeholder*="username" i]',
+    ]
+    password_selectors = [
+        'input[type="password"]',
+        'input[name*="password" i]',
+        'input[id*="password" i]',
+        'input[placeholder*="password" i]',
+    ]
+    continue_selectors = [
+        'button:has-text("Next")',
+        'button:has-text("Continue")',
+        'button:has-text("Sign in")',
+        'button:has-text("Log in")',
+        'input[type="submit"]',
+    ]
+
+    log("Attempting ConstructConnect login with configured credentials")
+    username_input = first_visible_locator(page, username_selectors, timeout=8000)
+    if username_input:
+        username_input.fill(username)
+        click_first_visible(page, continue_selectors, timeout=4000)
+
+    password_input = first_visible_locator(page, password_selectors, timeout=10000)
+    if not password_input:
+        raise ConstructConnectLoginRequired(LOGIN_REQUIRED_MESSAGE)
+
+    password_input.fill(password)
+    if not click_first_visible(page, continue_selectors, timeout=5000):
+        password_input.press("Enter")
+
+    page.wait_for_timeout(5000)
+    page.goto(SEARCH_URL, wait_until="domcontentloaded")
+    page.wait_for_timeout(3000)
+
+    if not has_search_ui(page):
+        raise ConstructConnectLoginRequired(LOGIN_REQUIRED_MESSAGE)
+
+
+def ensure_constructconnect_login(page: Page, *, non_interactive: bool = False) -> None:
     log("Opening ConstructConnect search page")
     page.goto(SEARCH_URL, wait_until="domcontentloaded")
     page.wait_for_timeout(2500)
 
-    try:
-        if page.locator("#demo-input-local").first.is_visible():
-            log("Existing ConstructConnect session detected")
+    if has_search_ui(page):
+        log("Existing ConstructConnect session detected")
+        return
+
+    if non_interactive:
+        attempt_constructconnect_login(page)
+        return
+
+    if looks_like_login_page(page):
+        try:
+            attempt_constructconnect_login(page)
             return
-    except Exception:
-        pass
+        except ConstructConnectLoginRequired:
+            pass
 
     print("\nPlease log in to ConstructConnect manually in the opened browser.")
     print("This login should persist in the Playwright profile until ConstructConnect times out.")
@@ -164,12 +335,22 @@ def wait_for_manual_login(page: Page) -> None:
     input()
     page.wait_for_timeout(1500)
 
+    page.goto(SEARCH_URL, wait_until="domcontentloaded")
+    page.wait_for_timeout(2500)
+    if not has_search_ui(page):
+        raise ConstructConnectLoginRequired(LOGIN_REQUIRED_MESSAGE)
+
 
 def open_search(page: Page) -> None:
     log("Opening search page")
     page.goto(SEARCH_URL, wait_until="domcontentloaded")
     page.wait_for_timeout(2500)
-    wait_visible(page, "#demo-input-local")
+    try:
+        wait_visible(page, "#demo-input-local")
+    except Exception as exc:
+        if looks_like_login_page(page):
+            raise ConstructConnectLoginRequired(LOGIN_REQUIRED_MESSAGE) from exc
+        raise
 
 
 def clear_existing_search_filters(page: Page) -> None:
@@ -293,9 +474,66 @@ def get_visible_export_names(doc_page: Page) -> list[str]:
     return names
 
 
-def row_menu_arrow(row: Locator) -> Locator:
-    container = row.locator("xpath=ancestor::*[.//img[contains(@class,'miniDownArrow')]][1]").first
-    return container.locator("img.miniDownArrow:visible").first
+def export_row_container(row: Locator) -> Locator:
+    container_selectors = [
+        "xpath=ancestor-or-self::*[.//img[contains(@class,'miniDownArrow')]][1]",
+        "xpath=ancestor-or-self::*[.//*[contains(@class,'miniDownArrow')]][1]",
+        "xpath=ancestor-or-self::*[contains(@class,'export')][1]",
+        "xpath=ancestor-or-self::*[contains(@id,'export')][1]",
+    ]
+
+    for selector in container_selectors:
+        try:
+            container = row.locator(selector).first
+            if container.count():
+                return container
+        except Exception:
+            continue
+
+    return row
+
+
+def open_row_menu(doc_page: Page, row: Locator) -> Locator:
+    arrow_selectors = [
+        "img.miniDownArrow",
+        ".miniDownArrow",
+        '[class*="miniDownArrow"]',
+        '[class*="DownArrow"]',
+        '[aria-haspopup="true"]',
+        'button[aria-haspopup="true"]',
+        "xpath=following::*[contains(@class,'miniDownArrow')][1]",
+        "xpath=following::*[contains(@class,'DownArrow')][1]",
+    ]
+
+    deadline = time.monotonic() + (MENU_CLICK_TIMEOUT_MS / 1000)
+    last_error: Exception | None = None
+
+    while time.monotonic() < deadline:
+        container = export_row_container(row)
+
+        try:
+            row.scroll_into_view_if_needed(timeout=3000)
+            row.hover(timeout=3000)
+        except Exception:
+            pass
+
+        for selector in arrow_selectors:
+            candidates = [container.locator(selector).first, row.locator(selector).first]
+            for arrow in candidates:
+                try:
+                    if not arrow.count():
+                        continue
+                    arrow.click(force=True, timeout=5000)
+                    return container
+                except Exception as exc:
+                    last_error = exc
+
+        doc_page.wait_for_timeout(1000)
+
+    if last_error:
+        raise last_error
+
+    raise RuntimeError("Could not find a row action menu control for the exported file.")
 
 
 def click_any_visible_delete_all(doc_page: Page) -> bool:
@@ -457,14 +695,8 @@ def download_new_exported_files(doc_page: Page, project: Project, before_names: 
             try:
                 log(f"Opening menu for row: {display_name} / attempt {attempt}")
 
-                arrow = row_menu_arrow(row)
-                arrow.wait_for(state="visible", timeout=MENU_CLICK_TIMEOUT_MS)
-                arrow.click(force=True, timeout=MENU_CLICK_TIMEOUT_MS)
+                container = open_row_menu(doc_page, row)
                 doc_page.wait_for_timeout(1200)
-
-                container = row.locator(
-                    "xpath=ancestor::*[.//img[contains(@class,'miniDownArrow')]][1]"
-                ).first
 
                 menu_item = container.locator(
                     'a.ui-corner-all:has-text("Download file"):visible'
@@ -574,6 +806,7 @@ def print_summary(projects: list[Project]) -> None:
 
     for i, p in enumerate(attempted, start=1):
         print(f"\nProject #{i}: {p.title}")
+        print(f"• Manufacturer Tab: {p.tab_name}")
         print(f"• Project ID: {p.project_id}")
         print(f"• State: {p.state}")
         print(f"• Bid Date: {p.bid_date}")
@@ -588,68 +821,174 @@ def print_summary(projects: list[Project]) -> None:
 
 
 
-def update_sheet_status(sheets_service, row_number: int, value: str) -> None:
+def update_sheet_status(sheets_service, project: Project, value: str) -> None:
     sheets_service.spreadsheets().values().update(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"{TAB_NAME}!L{row_number}",
+        range=sheet_range(project.tab_name, f"L{project.row_number}"),
         valueInputOption="USER_ENTERED",
         body={"values": [[value]]},
     ).execute()
 
 
+def try_update_sheet_status(sheets_service, project: Project, value: str) -> bool:
+    try:
+        update_sheet_status(sheets_service, project, value)
+        return True
+    except Exception as exc:
+        print(
+            f"  WARNING: Could not write '{value}' to "
+            f"{project.tab_name} row {project.row_number} Download_Status: {exc}"
+        )
+        return False
+
+
+def launch_context(pw, *, headless: bool):
+    return pw.chromium.launch_persistent_context(
+        user_data_dir=str(PROFILE_DIR),
+        headless=headless,
+        accept_downloads=True,
+    )
+
+
+def check_login(*, headless: bool) -> bool:
+    print("\n" + "=" * 80)
+    print("CONSTRUCTCONNECT LOGIN CHECK")
+    print("=" * 80)
+
+    try:
+        with sync_playwright() as pw:
+            context = launch_context(pw, headless=headless)
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                ensure_constructconnect_login(page, non_interactive=True)
+            finally:
+                context.close()
+    except ConstructConnectLoginRequired as exc:
+        print(f"\n{exc}")
+        return False
+    except Exception as exc:
+        print(f"\nConstructConnect login check failed: {exc}")
+        return False
+
+    print("\n✓ ConstructConnect session is active.")
+    return True
+
+
 def main() -> int:
+    load_dotenv()
+
+    parser = argparse.ArgumentParser(description="ConstructConnect Playwright document downloader")
+    parser.add_argument("--check-login", action="store_true",
+                        help="Open the Playwright profile and verify ConstructConnect is logged in")
+    parser.add_argument("--non-interactive", action="store_true",
+                        help="Fail instead of waiting for manual login")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run the browser headless")
+    parser.add_argument(
+        "--run-day",
+        choices=WEEKDAYS,
+        default=datetime.now().strftime("%A").lower(),
+        help="Pretend today is this weekday for manual testing",
+    )
+    args = parser.parse_args()
+
+    headless = args.headless or HEADLESS
+
+    if args.check_login:
+        return 0 if check_login(headless=headless) else 1
+
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     sheets_service = get_sheets_service()
-    projects = fetch_projects()
+    manufacturers = scheduled_manufacturers(args.run_day)
+
+    if not manufacturers:
+        print(f"No ConstructConnect manufacturers scheduled for {args.run_day.title()}.")
+        return 0
+
+    print(f"Processing {args.run_day.title()} manufacturers: {', '.join(manufacturers)}")
+
+    projects = []
+    for manufacturer in manufacturers:
+        projects.extend(fetch_projects(sheets_service, manufacturer))
 
     if not projects:
-        print("\nNo unprocessed projects found.")
+        print("\nNo unprocessed projects found in scheduled manufacturer tabs.")
         return 0
 
     print("\nProjects queued:")
     for p in projects:
-        print(f"[Row {p.row_number}] - {p.title} - {p.project_id} - {p.status}")
+        print(f"[{p.tab_name} Row {p.row_number}] - {p.title} - {p.project_id} - {p.status}")
+
+    login_required = False
+    sheet_update_failed = False
 
     with sync_playwright() as pw:
-        profile_dir = Path("playwright_cc_profile")
-        context = pw.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            headless=HEADLESS,
-            accept_downloads=True,
-        )
-        page = context.pages[0] if context.pages else context.new_page()
+        context = launch_context(pw, headless=headless)
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
 
-        wait_for_manual_login(page)
-
-        for project in projects:
-            if project.status == "Skipped":
-                continue
-
-            print(f"\nProcessing Row {project.row_number}: {project.title} ({project.project_id})")
             try:
-                process_project(page, project)
-                update_sheet_status(sheets_service, project.row_number, "Processed")
-            except Exception as exc:
-                project.error = str(exc)
-                update_sheet_status(sheets_service, project.row_number, "Error")
-                print(f"  ERROR: {exc}")
+                ensure_constructconnect_login(page, non_interactive=args.non_interactive)
+            except ConstructConnectLoginRequired as exc:
+                print(f"\n{exc}")
+                return 1
 
-        pending = verify_all_processed(projects)
-        if pending:
-            print("\nRetrying pending projects once...")
-            for project in pending:
+            for project in projects:
+                if project.status == "Skipped":
+                    continue
+
+                print(
+                    f"\nProcessing {project.tab_name} row {project.row_number}: "
+                    f"{project.title} ({project.project_id})"
+                )
                 try:
                     process_project(page, project)
-                    project.error = ""
-                    update_sheet_status(sheets_service, project.row_number, "Processed")
+                    if not try_update_sheet_status(sheets_service, project, "Processed"):
+                        sheet_update_failed = True
+                except ConstructConnectLoginRequired as exc:
+                    login_required = True
+                    project.error = str(exc)
+                    if not try_update_sheet_status(sheets_service, project, "Error"):
+                        sheet_update_failed = True
+                    print(f"  ERROR: {exc}")
+                    break
                 except Exception as exc:
                     project.error = str(exc)
-                    update_sheet_status(sheets_service, project.row_number, "Error")
-                    print(f"  RETRY ERROR: {project.project_id} - {exc}")
+                    if not try_update_sheet_status(sheets_service, project, "Error"):
+                        sheet_update_failed = True
+                    print(f"  ERROR: {exc}")
 
-        context.close()
+            pending = verify_all_processed(projects)
+            if pending and not login_required:
+                print("\nRetrying pending projects once...")
+                for project in pending:
+                    try:
+                        process_project(page, project)
+                        project.error = ""
+                        if not try_update_sheet_status(sheets_service, project, "Processed"):
+                            sheet_update_failed = True
+                    except ConstructConnectLoginRequired as exc:
+                        login_required = True
+                        project.error = str(exc)
+                        if not try_update_sheet_status(sheets_service, project, "Error"):
+                            sheet_update_failed = True
+                        print(f"  RETRY ERROR: {project.project_id} - {exc}")
+                        break
+                    except Exception as exc:
+                        project.error = str(exc)
+                        if not try_update_sheet_status(sheets_service, project, "Error"):
+                            sheet_update_failed = True
+                        print(f"  RETRY ERROR: {project.project_id} - {exc}")
+        finally:
+            context.close()
 
     print_summary(projects)
+    if login_required:
+        print("\nConstructConnect login refresh is required before the scheduled workflow can continue.")
+        return 1
+    if sheet_update_failed:
+        print("\nOne or more ConstructConnect rows processed, but Sheet status updates failed.")
+        return 1
     return 0
 
 

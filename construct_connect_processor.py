@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import argparse
 import base64
+from datetime import datetime
 import io
 import os
 from pathlib import Path
 
 import pandas as pd
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -14,15 +17,22 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 
 # --- Config ---
 SPREADSHEET_ID = "1vqEd71BGHNMDJdBcymM4cgGzEQhlXsib3sFXY9Qlt7U"
-TAB_NAME = "Fortress"
 CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE = "token.json"
 
 EMAIL_FROM = "beastman7272@gmail.com"
-SUBJECT_TEXT = "Fortress"
+
+MANUFACTURER_DAYS = {
+    "Citadel": {"monday"},
+    "Fortress": {"tuesday", "sunday"},
+    "Fabral": {"wednesday", "saturday"},
+    "Metal-Era": {"thursday"},
+}
+
+WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
@@ -45,16 +55,23 @@ def get_creds() -> Credentials:
 
     if Path(TOKEN_FILE).exists():
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+        if not creds.has_scopes(SCOPES):
+            Path(TOKEN_FILE).unlink(missing_ok=True)
+            creds = None
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except RefreshError:
+                Path(TOKEN_FILE).unlink(missing_ok=True)
+                creds = None
+
+        if not creds or not creds.valid:
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
 
-        with open(TOKEN_FILE, "w") as token:
-            token.write(creds.to_json())
+        Path(TOKEN_FILE).write_text(creds.to_json(), encoding="utf-8")
 
     return creds
 
@@ -100,15 +117,44 @@ def column_values(df: pd.DataFrame, *names: str, required: bool = True):
     return ""
 
 
-def find_matching_message(gmail_service):
-    query = f'from:{EMAIL_FROM} subject:{SUBJECT_TEXT} newer_than:3d has:attachment'
-    result = gmail_service.users().messages().list(userId="me", q=query, maxResults=10).execute()
-    messages = result.get("messages", [])
+def sheet_range(tab_name: str, range_name: str) -> str:
+    escaped_tab_name = tab_name.replace("'", "''")
+    return f"'{escaped_tab_name}'!{range_name}"
 
-    if not messages:
-        raise RuntimeError("No matching email found in the last 24 hours.")
 
-    return messages[0]["id"]
+def scheduled_manufacturers(run_day: str) -> list[str]:
+    return [
+        manufacturer
+        for manufacturer, days in MANUFACTURER_DAYS.items()
+        if run_day in days
+    ]
+
+
+def find_matching_messages(gmail_service, subject_text: str) -> list[str]:
+    # For local testing, forwarded emails may come from different accounts.
+    # Add back f"from:{EMAIL_FROM} " when matching against original production senders.
+    queries = [
+        f'subject:"{subject_text}" is:unread newer_than:1d has:attachment',
+        f"subject:{subject_text} is:unread newer_than:1d has:attachment",
+        f'"{subject_text}" is:unread newer_than:1d has:attachment',
+    ]
+
+    for query in queries:
+        result = gmail_service.users().messages().list(userId="me", q=query, maxResults=10).execute()
+        messages = result.get("messages", [])
+        print(f"Gmail search matched {len(messages)} message(s): {query}")
+        if messages:
+            return [message["id"] for message in messages]
+
+    return []
+
+
+def mark_as_read(gmail_service, message_id: str) -> None:
+    gmail_service.users().messages().modify(
+        userId="me",
+        id=message_id,
+        body={"removeLabelIds": ["UNREAD"]},
+    ).execute()
 
 
 def walk_parts_for_attachment(parts):
@@ -211,29 +257,66 @@ def load_excel_rows(file_bytes: bytes, filename: str) -> list[list]:
     return rows
 
 
-def append_to_sheet(sheets_service, rows: list[list]) -> None:
+def append_to_sheet(sheets_service, tab_name: str, rows: list[list]) -> None:
     body = {"values": rows}
 
     sheets_service.spreadsheets().values().append(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"{TAB_NAME}!A:A",
+        range=sheet_range(tab_name, "A:A"),
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
         body=body,
     ).execute()
 
 
+def process_manufacturer(gmail_service, sheets_service, manufacturer: str) -> int:
+    message_ids = find_matching_messages(gmail_service, manufacturer)
+    if not message_ids:
+        print(f"No unread {manufacturer} email found in the last day.")
+        return 0
+
+    appended_count = 0
+    for message_id in message_ids:
+        filename, file_bytes = download_excel_attachment(gmail_service, message_id)
+        rows = load_excel_rows(file_bytes, filename)
+        append_to_sheet(sheets_service, manufacturer, rows)
+        mark_as_read(gmail_service, message_id)
+        appended_count += len(rows)
+        print(f"Done. Appended {len(rows)} rows from {filename} to tab '{manufacturer}'.")
+
+    return appended_count
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Process ConstructConnect manufacturer emails into Sheets")
+    parser.add_argument(
+        "--run-day",
+        choices=WEEKDAYS,
+        default=datetime.now().strftime("%A").lower(),
+        help="Pretend today is this weekday for manual testing",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+    manufacturers = scheduled_manufacturers(args.run_day)
+
+    if not manufacturers:
+        print(f"No ConstructConnect manufacturers scheduled for {args.run_day.title()}.")
+        return
+
     creds = get_creds()
     gmail_service = build("gmail", "v1", credentials=creds)
     sheets_service = build("sheets", "v4", credentials=creds)
 
-    message_id = find_matching_message(gmail_service)
-    filename, file_bytes = download_excel_attachment(gmail_service, message_id)
-    rows = load_excel_rows(file_bytes, filename)
-    append_to_sheet(sheets_service, rows)
+    total_rows = 0
+    print(f"Processing {args.run_day.title()} manufacturers: {', '.join(manufacturers)}")
 
-    print(f"Done. Appended {len(rows)} rows from {filename} to tab '{TAB_NAME}'.")
+    for manufacturer in manufacturers:
+        total_rows += process_manufacturer(gmail_service, sheets_service, manufacturer)
+
+    print(f"Finished. Appended {total_rows} total row(s).")
 
 
 if __name__ == "__main__":

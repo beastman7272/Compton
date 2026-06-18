@@ -64,15 +64,21 @@ CREDENTIALS_FILE = env_path("GOOGLE_CREDENTIALS_FILE", PROJECT_ROOT / "credentia
 # BuildingConnected / Bid Board sheet
 BC_SHEET_ID = env_value("BID_BOARD_SHEET_ID", "14PMQx_SiNkSX2gLWtfjsIEpovmADJpv1f53bhICQKfY")
 BC_TAB_NAME = env_value("BID_BOARD_TAB_NAME", "Sheet1")
-BC_RANGE = f"{BC_TAB_NAME}!A1:G1000"
 BC_STATUS_COL = "G"
 
 # ConstructConnect sheet
 CC_SHEET_ID = env_value("CONSTRUCTCONNECT_SHEET_ID", "1vqEd71BGHNMDJdBcymM4cgGzEQhlXsib3sFXY9Qlt7U")
 CC_TAB_NAME = env_value("CONSTRUCTCONNECT_TAB_NAME", "Fortress")
-CC_RANGE = f"{CC_TAB_NAME}!A1:M1000"
 CC_DOWNLOAD_STATUS_COL_INDEX = 12  # L
 CC_IMPORT_STATUS_COL = "M"         # CQE/import status
+
+MANUFACTURER_DAYS = {
+    "Citadel": {"monday"},
+    "Fortress": {"tuesday", "sunday"},
+    "Fabral": {"wednesday", "saturday"},
+    "Metal-Era": {"thursday"},
+}
+WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 
 MATCH_THRESHOLD = 0.78
@@ -162,6 +168,19 @@ def clean(value: object) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def sheet_range(tab_name: str, range_name: str) -> str:
+    escaped_tab_name = tab_name.replace("'", "''")
+    return f"'{escaped_tab_name}'!{range_name}"
+
+
+def scheduled_manufacturers(run_day: str) -> list[str]:
+    return [
+        manufacturer
+        for manufacturer, days in MANUFACTURER_DAYS.items()
+        if run_day in days
+    ]
 
 
 def norm(value: str) -> str:
@@ -290,7 +309,7 @@ def update_sheet_status(
 ) -> None:
     service.spreadsheets().values().update(
         spreadsheetId=item.source_sheet_id,
-        range=f"{item.source_tab}!{item.import_status}{item.source_row}",
+        range=sheet_range(item.source_tab, f"{item.import_status}{item.source_row}"),
         valueInputOption="USER_ENTERED",
         body={"values": [[status]]},
     ).execute()
@@ -312,7 +331,7 @@ def read_buildingconnected_rows(service) -> list[ImportItem]:
 
     Rows with blank G are ready to import.
     """
-    values = read_values(service, BC_SHEET_ID, BC_RANGE)
+    values = read_values(service, BC_SHEET_ID, sheet_range(BC_TAB_NAME, "A1:G1000"))
 
     rows: list[ImportItem] = []
 
@@ -357,7 +376,7 @@ def read_buildingconnected_rows(service) -> list[ImportItem]:
     return rows
 
 
-def read_constructconnect_rows(service) -> list[ImportItem]:
+def read_constructconnect_rows(service, tab_name: str) -> list[ImportItem]:
     """
     ConstructConnect columns expected from existing flow:
 
@@ -379,7 +398,7 @@ def read_constructconnect_rows(service) -> list[ImportItem]:
     - K == Processed
     - L is blank
     """
-    values = read_values(service, CC_SHEET_ID, CC_RANGE)
+    values = read_values(service, CC_SHEET_ID, sheet_range(tab_name, "A1:M1000"))
 
     rows: list[ImportItem] = []
 
@@ -412,7 +431,7 @@ def read_constructconnect_rows(service) -> list[ImportItem]:
             ImportItem(
                 source_system="ConstructConnect",
                 source_sheet_id=CC_SHEET_ID,
-                source_tab=CC_TAB_NAME,
+                source_tab=tab_name,
                 source_row=i,
                 source_project_id=project_id,
                 project_name=title,
@@ -431,14 +450,22 @@ def read_constructconnect_rows(service) -> list[ImportItem]:
     return rows
 
 
-def read_rows(service, source: str) -> list[ImportItem]:
+def read_rows(service, source: str, constructconnect_tabs: list[str]) -> list[ImportItem]:
     if source == "bc":
         return read_buildingconnected_rows(service)
 
     if source == "cc":
-        return read_constructconnect_rows(service)
+        return [
+            item
+            for tab_name in constructconnect_tabs
+            for item in read_constructconnect_rows(service, tab_name)
+        ]
 
-    return read_buildingconnected_rows(service) + read_constructconnect_rows(service)
+    return read_buildingconnected_rows(service) + [
+        item
+        for tab_name in constructconnect_tabs
+        for item in read_constructconnect_rows(service, tab_name)
+    ]
 
 
 def parse_city_state(address_raw: str) -> tuple[str, str]:
@@ -552,6 +579,7 @@ def find_matching_download(item: ImportItem, downloads_dir: Path = DOWNLOADS) ->
 
 def run_import(
     source: str,
+    run_day: str,
     db_path: Path,
     storage_root: Path,
     downloads_dir: Path,
@@ -559,7 +587,14 @@ def run_import(
     update_sheets: bool,
 ) -> RunSummary:
     service = get_sheets_service()
-    rows = read_rows(service, source)
+    constructconnect_tabs = scheduled_manufacturers(run_day)
+    if not constructconnect_tabs:
+        constructconnect_tabs = [CC_TAB_NAME]
+
+    if source in {"both", "cc"}:
+        print(f"ConstructConnect tabs for {run_day.title()}: {', '.join(constructconnect_tabs)}")
+
+    rows = read_rows(service, source, constructconnect_tabs)
 
     summary = RunSummary(total=len(rows))
 
@@ -681,6 +716,13 @@ def main() -> int:
     )
 
     parser.add_argument(
+        "--run-day",
+        choices=WEEKDAYS,
+        default=datetime.now().strftime("%A").lower(),
+        help="Pretend today is this weekday for scheduled ConstructConnect tabs.",
+    )
+
+    parser.add_argument(
         "--no-sheet-update",
         action="store_true",
         help="Do not update Google Sheet import statuses.",
@@ -690,6 +732,7 @@ def main() -> int:
 
     summary = run_import(
         source=args.source,
+        run_day=args.run_day,
         db_path=Path(args.db_path),
         storage_root=Path(args.storage_root),
         downloads_dir=Path(args.downloads_dir),

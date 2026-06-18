@@ -32,6 +32,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 
 try:
+    from google.auth.exceptions import RefreshError
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
     from google.auth.transport.requests import Request
@@ -126,8 +127,14 @@ def get_sheets_service():
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except RefreshError:
+                if os.path.exists(TOKEN_FILE):
+                    os.remove(TOKEN_FILE)
+                creds = None
+
+        if not creds or not creds.valid:
             if not os.path.exists(CREDENTIALS_FILE):
                 print(f"ERROR: {CREDENTIALS_FILE} not found.")
                 print("Download OAuth credentials from Google Cloud Console.")
@@ -513,7 +520,7 @@ def phase3_finalize(service):
 
     if not os.path.exists(RUN_STATE_FILE):
         print(f"\nNo {RUN_STATE_FILE} found. Run Phase 1 first.")
-        return
+        return True
 
     with open_utf8(RUN_STATE_FILE, "r") as f:
         tasks = json.load(f)
@@ -715,19 +722,19 @@ def phase2_playwright_run(
 
     if not os.path.exists(RUN_STATE_FILE):
         print(f"\nNo {RUN_STATE_FILE} found. Run Phase 1 first.")
-        return
+        return True
 
     with open_utf8(RUN_STATE_FILE, "r") as f:
         tasks = json.load(f)
 
     if not tasks:
         print("\nNo pending browser tasks in run state.")
-        return
+        return True
 
     if apply_results and not (select_files or download_files):
         print("\nRefusing to apply Playwright results without file selection.")
         print("Rerun with --playwright-select-files or --playwright-download-files.")
-        return
+        return False
 
     try:
         from playwright.sync_api import sync_playwright
@@ -741,7 +748,7 @@ def phase2_playwright_run(
     except ImportError as exc:
         print(f"\nMissing Playwright dependency or helper import: {exc}")
         print("Install Playwright dependencies before running --playwright-run.")
-        return
+        return False
 
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     results = []
@@ -791,7 +798,7 @@ def phase2_playwright_run(
 
     if not apply_results:
         print("\nSheets were not updated. Rerun with --apply-playwright-results after reviewing results.")
-        return
+        return True
 
     errors = [
         item
@@ -800,8 +807,10 @@ def phase2_playwright_run(
     ]
     if errors:
         print("\nPlaywright returned errors; Sheets were not updated and run_state.json was kept.")
+        if any(item["result"].get("login_required") for item in errors):
+            print("BuildingConnected login/MFA refresh is required before the scheduled workflow can continue.")
         print("Review playwright_results.json, fix the issue, then rerun the workflow.")
-        return
+        return False
 
     bb_rows = read_sheet(service, BID_BOARD_SHEET_ID, "Sheet1!A1:G1000")
     bb_data = bb_rows[1:] if len(bb_rows) > 1 else []
@@ -817,6 +826,54 @@ def phase2_playwright_run(
 
     os.remove(RUN_STATE_FILE)
     print("\n✓ Playwright finalization complete. Run state cleared.")
+    return True
+
+
+def check_buildingconnected_login(*, browser="chrome", cdp_url=None, headless=False):
+    print("\n" + "=" * 70)
+    print("BUILDINGCONNECTED LOGIN CHECK")
+    print("=" * 70)
+
+    try:
+        from playwright.sync_api import sync_playwright
+        from buildingconnected_playwright import (
+            BuildingConnectedLoginRequired,
+            NAV_TIMEOUT_MS,
+            attach_context,
+            ensure_pipeline,
+            launch_context,
+        )
+    except ImportError as exc:
+        print(f"\nMissing Playwright dependency or helper import: {exc}")
+        print("Install Playwright dependencies before running the login check.")
+        return False
+
+    try:
+        with sync_playwright() as pw:
+            browser_instance = None
+            if cdp_url:
+                browser_instance, context = attach_context(pw, cdp_url)
+            else:
+                context = launch_context(pw, browser, headless)
+
+            try:
+                context.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+                page = context.pages[0] if context.pages else context.new_page()
+                ensure_pipeline(page, non_interactive=True)
+            finally:
+                if not cdp_url:
+                    context.close()
+                elif browser_instance:
+                    browser_instance.close()
+    except BuildingConnectedLoginRequired as exc:
+        print(f"\n{exc}")
+        return False
+    except Exception as exc:
+        print(f"\nBuildingConnected login check failed: {exc}")
+        return False
+
+    print("\n✓ BuildingConnected session is active.")
+    return True
 
 
 # ── Status ────────────────────────────────────────────────────────────────
@@ -864,6 +921,8 @@ def main():
                         help="Phase 2: process run_state.json browser tasks with Playwright")
     parser.add_argument("--run-playwright-workflow", action="store_true",
                         help="Run Phase 1, then Playwright download/apply in one command")
+    parser.add_argument("--check-buildingconnected-login", action="store_true",
+                        help="Open the Playwright profile and verify BuildingConnected is logged in")
     parser.add_argument("--playwright-browser", choices=["auto", "chrome", "msedge", "chromium"],
                         default="chrome", help="Browser channel for Playwright runs")
     parser.add_argument("--playwright-cdp-url",
@@ -887,19 +946,31 @@ def main():
         or args.apply_playwright_results
     )
     if not args.playwright_run and playwright_flag_without_run:
-        if not args.run_playwright_workflow:
-            parser.error("Playwright options require --playwright-run or --run-playwright-workflow")
+        if not args.run_playwright_workflow and not args.check_buildingconnected_login:
+            parser.error(
+                "Playwright options require --playwright-run, "
+                "--run-playwright-workflow, or --check-buildingconnected-login"
+            )
 
     try:
+        if args.check_buildingconnected_login:
+            return 0 if check_buildingconnected_login(
+                browser=args.playwright_browser,
+                cdp_url=args.playwright_cdp_url,
+                headless=args.playwright_headless,
+            ) else 1
+
         service = get_sheets_service()
 
         if args.status:
             show_status(service)
+            return 0
         elif args.finalize:
             phase3_finalize(service)
+            return 0
         elif args.run_playwright_workflow:
             phase1_process(service)
-            phase2_playwright_run(
+            ok = phase2_playwright_run(
                 service,
                 browser=args.playwright_browser,
                 cdp_url=args.playwright_cdp_url,
@@ -908,8 +979,9 @@ def main():
                 download_files=True,
                 apply_results=True,
             )
+            return 0 if ok else 1
         elif args.playwright_run:
-            phase2_playwright_run(
+            ok = phase2_playwright_run(
                 service,
                 browser=args.playwright_browser,
                 cdp_url=args.playwright_cdp_url,
@@ -918,13 +990,15 @@ def main():
                 download_files=args.playwright_download_files,
                 apply_results=args.apply_playwright_results,
             )
+            return 0 if ok else 1
         else:
             phase1_process(service)
+            return 0
     except HttpError as exc:
         if explain_http_error(exc):
-            return
+            return 1
         raise
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
