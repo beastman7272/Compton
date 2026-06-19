@@ -17,6 +17,7 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
 $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $LogPath = Join-Path $LogDir "$Timestamp.log"
+$WorkflowFailures = @()
 
 function Write-Log {
     param([string]$Message)
@@ -47,10 +48,12 @@ function Invoke-PythonStep {
 
     if ($exitCode -ne 0) {
         Write-Log "FAILED: $Name exited with code $exitCode"
-        exit $exitCode
+        $script:WorkflowFailures += "$Name exited with code $exitCode"
+        return $false
     }
 
     Write-Log "DONE: $Name"
+    return $true
 }
 
 function Add-RunDayArgs {
@@ -70,11 +73,11 @@ if ($RunDay) {
     Write-Log "Run day override: $RunDay"
 }
 
-Invoke-PythonStep "BuildingConnected login check" @("bid_board_orchestrator.py", "--check-buildingconnected-login")
-Invoke-PythonStep "ConstructConnect email processor" (Add-RunDayArgs @("construct_connect_processor.py"))
-Invoke-PythonStep "ConstructConnect Playwright workflow" (Add-RunDayArgs @("construct_connect_playwright.py", "--non-interactive"))
-Invoke-PythonStep "Stage 1 email processor" @("stage1_email_processor.py")
-Invoke-PythonStep "BuildingConnected workflow" @("bid_board_orchestrator.py", "--run-playwright-workflow")
+[void](Invoke-PythonStep "BuildingConnected login check" @("bid_board_orchestrator.py", "--check-buildingconnected-login"))
+[void](Invoke-PythonStep "ConstructConnect email processor" (Add-RunDayArgs @("construct_connect_processor.py")))
+[void](Invoke-PythonStep "ConstructConnect Playwright workflow" (Add-RunDayArgs @("construct_connect_playwright.py", "--non-interactive")))
+[void](Invoke-PythonStep "Stage 1 email processor" @("stage1_email_processor.py"))
+[void](Invoke-PythonStep "BuildingConnected workflow" @("bid_board_orchestrator.py", "--run-playwright-workflow"))
 
 $ImportArgs = Add-RunDayArgs @("scripts\run_import.py")
 if ($ImportDryRun) {
@@ -83,8 +86,17 @@ if ($ImportDryRun) {
 if ($NoSheetUpdate) {
     $ImportArgs += "--no-sheet-update"
 }
-Invoke-PythonStep "CQE import workflow" $ImportArgs
+[void](Invoke-PythonStep "CQE import workflow" $ImportArgs)
 
 Write-Log ""
+if ($WorkflowFailures.Count -gt 0) {
+    Write-Log "Daily workflow completed with failures:"
+    foreach ($failure in $WorkflowFailures) {
+        Write-Log "  - $failure"
+    }
+    Write-Log "Log saved to: $LogPath"
+    exit 1
+}
+
 Write-Log "Daily workflow completed successfully"
 Write-Log "Log saved to: $LogPath"

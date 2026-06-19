@@ -14,7 +14,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from dotenv import load_dotenv
-from playwright.sync_api import Download, Locator, Page, sync_playwright
+from playwright.sync_api import Download, Locator, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 SPREADSHEET_ID = "1vqEd71BGHNMDJdBcymM4cgGzEQhlXsib3sFXY9Qlt7U"
 CREDENTIALS_FILE = "credentials.json"
@@ -75,6 +75,10 @@ def log(step: str) -> None:
 
 class ConstructConnectLoginRequired(RuntimeError):
     """Raised when the persistent browser profile needs a fresh ConstructConnect login."""
+
+
+class ConstructConnectProjectNotFound(RuntimeError):
+    """Raised when a project search returns no matching ConstructConnect project."""
 
 
 def get_creds() -> Credentials:
@@ -410,7 +414,12 @@ def search_project(page: Page, project_id: str, title: str) -> None:
         except Exception:
             pass
 
-    row.wait_for(state="visible", timeout=12000)
+    try:
+        row.wait_for(state="visible", timeout=12000)
+    except PlaywrightTimeoutError as exc:
+        raise ConstructConnectProjectNotFound(
+            f"Project {project_id} was not found in ConstructConnect search results."
+        ) from exc
 
 
 def open_project(page: Page, project_id: str, title: str) -> None:
@@ -952,6 +961,12 @@ def main() -> int:
                         sheet_update_failed = True
                     print(f"  ERROR: {exc}")
                     break
+                except ConstructConnectProjectNotFound as exc:
+                    project.status = "Not Found"
+                    project.error = str(exc)
+                    if not try_update_sheet_status(sheets_service, project, "Not Found"):
+                        sheet_update_failed = True
+                    print(f"  NOT FOUND: {exc}")
                 except Exception as exc:
                     project.error = str(exc)
                     if not try_update_sheet_status(sheets_service, project, "Error"):
@@ -974,6 +989,12 @@ def main() -> int:
                             sheet_update_failed = True
                         print(f"  RETRY ERROR: {project.project_id} - {exc}")
                         break
+                    except ConstructConnectProjectNotFound as exc:
+                        project.status = "Not Found"
+                        project.error = str(exc)
+                        if not try_update_sheet_status(sheets_service, project, "Not Found"):
+                            sheet_update_failed = True
+                        print(f"  RETRY NOT FOUND: {project.project_id} - {exc}")
                     except Exception as exc:
                         project.error = str(exc)
                         if not try_update_sheet_status(sheets_service, project, "Error"):

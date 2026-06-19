@@ -809,16 +809,23 @@ def visible_file_items(page: Page) -> list[dict[str, str]]:
             const text = clean(el.innerText || el.textContent || '');
             const title = clean(el.getAttribute('title'));
             const aria = clean(el.getAttribute('aria-label'));
+            const className = clean(el.className?.toString() || '');
+            const href = clean(el.getAttribute('href'));
             const combined = clean([text, title, aria].filter(Boolean).join(' | '));
             if (!combined || combined.length > 500) continue;
 
             const lower = combined.toLowerCase();
+            const classLower = className.toLowerCase();
             const looksRelevant =
               /\\.(pdf|zip|docx?|xlsx?|dwg)\\b/i.test(combined) ||
+              classLower.includes('folder') ||
+              classLower.includes('file') ||
               lower.includes('folder') ||
               lower.includes('download') ||
               lower.includes('spec') ||
               lower.includes('plan') ||
+              lower.includes('drawing') ||
+              lower.includes('document') ||
               lower.includes('addendum');
 
             if (!looksRelevant) continue;
@@ -831,6 +838,8 @@ def visible_file_items(page: Page) -> list[dict[str, str]]:
               text,
               title,
               aria,
+              className,
+              href,
             });
           }
 
@@ -861,6 +870,22 @@ def extract_file_name(raw: str) -> str:
 
 def is_probable_file(name: str) -> bool:
     return bool(re.search(r"\.(pdf|zip|docx?|xlsx?|dwg|rvt|txt)\b", name, re.I))
+
+
+def item_looks_like_folder(item: dict[str, str]) -> bool:
+    class_name = item.get("className", "").lower()
+    href = item.get("href", "").lower()
+    combined = " ".join(
+        item.get(key, "")
+        for key in ("text", "title", "aria")
+    ).lower()
+
+    return (
+        "folder" in class_name
+        or "folder" in href
+        or "folder" in combined
+        or "directory" in class_name
+    )
 
 
 def should_skip_folder(name: str) -> tuple[bool, str]:
