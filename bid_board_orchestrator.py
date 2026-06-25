@@ -31,6 +31,9 @@ import json
 from datetime import datetime
 from difflib import SequenceMatcher
 
+from app import config
+from app.google_runtime import resolve_google_credentials_file, resolve_google_token_file
+
 try:
     from google.auth.exceptions import RefreshError
     from google.oauth2.credentials import Credentials
@@ -80,15 +83,15 @@ configure_text_io()
 
 # ── Config ────────────────────────────────────────────────────────────────
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-TOKEN_FILE = "orchestrator_token.json"
-CREDENTIALS_FILE = "credentials.json"
+TOKEN_FILE = resolve_google_token_file("orchestrator_token.json", use_file_env=False)
+CREDENTIALS_FILE = resolve_google_credentials_file("credentials.json")
 
 EMAILS_SHEET_ID = "1mhCWXwSUtV-AbBxLmEBS-jezkeujVPMYY9RD5ENlPFU"
 BID_BOARD_SHEET_ID = "14PMQx_SiNkSX2gLWtfjsIEpovmADJpv1f53bhICQKfY"
 
-COMET_PROMPT_FILE = "comet_prompt.txt"
-RUN_STATE_FILE = "run_state.json"
-PLAYWRIGHT_RESULTS_FILE = "playwright_results.json"
+COMET_PROMPT_FILE = config.COMET_PROMPT_FILE
+RUN_STATE_FILE = config.RUN_STATE_FILE
+PLAYWRIGHT_RESULTS_FILE = config.PLAYWRIGHT_RESULTS_FILE
 
 SKIP_BRANDS = []
 # SKIP_BRANDS = ["advance auto parts", "aldi", "autozone", "barnes & noble", "basss pro shops", "bath & body works", 

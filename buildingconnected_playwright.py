@@ -10,13 +10,14 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 
+from app import config
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import ElementHandle, Locator, Page, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 START_URL = "https://app.buildingconnected.com/opportunities/pipeline"
-PROFILE_DIR = Path("playwright_bc_profile")
-DOWNLOAD_DIR = Path.home() / "Downloads"
+PROFILE_DIR = config.BC_PLAYWRIGHT_PROFILE_DIR
+DOWNLOAD_DIR = config.DOWNLOADS_DIR
 DEFAULT_PROJECT = "Lee County General Services Building Expansion"
 LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled", "--start-maximized"]
 NAV_TIMEOUT_MS = 120_000
@@ -1334,6 +1335,7 @@ def download_selected_files(page: Page) -> Path:
 
 
 def launch_context(pw, browser: str, headless: bool):
+    effective_headless = headless or config.env_bool("CQE_PLAYWRIGHT_HEADLESS", False)
     channels = {
         "auto": ["chrome", "msedge", None],
         "chrome": ["chrome"],
@@ -1349,7 +1351,7 @@ def launch_context(pw, browser: str, headless: bool):
             log(f"Launching {label} with profile {profile_dir}")
             kwargs = {
                 "user_data_dir": str(profile_dir),
-                "headless": headless,
+                "headless": effective_headless,
                 "accept_downloads": True,
                 "args": LAUNCH_ARGS,
                 "viewport": None,

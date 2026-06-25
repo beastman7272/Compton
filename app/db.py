@@ -4,8 +4,10 @@ import sqlite3
 from pathlib import Path
 from typing import Iterable, Optional
 
+from app.config import DB_PATH
 
-DEFAULT_DB_PATH = Path("data") / "cqe.db"
+
+DEFAULT_DB_PATH = DB_PATH
 
 
 def get_connection(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:

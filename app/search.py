@@ -5,6 +5,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.config import DB_PATH
 from app.db import get_connection, touch_upload
 from app.pdf_text import extract_pdf_text
 from app.models import SearchFilter, SearchTerm, SearchResult
@@ -324,7 +325,7 @@ def index_upload(
 
 
 def index_pending_uploads(
-    db_path: Path | str = Path("data") / "cqe.db",
+    db_path: Path | str = DB_PATH,
     max_uploads: int | None = None,
     max_matches_per_term: int = DEFAULT_MATCH_LIMIT_PER_TERM,
 ) -> None:
@@ -374,7 +375,7 @@ def index_pending_uploads(
 
 def index_upload_ids(
     upload_ids: list[int],
-    db_path: Path | str = Path("data") / "cqe.db",
+    db_path: Path | str = DB_PATH,
     max_matches_per_term: int = DEFAULT_MATCH_LIMIT_PER_TERM,
 ) -> None:
     """

@@ -10,13 +10,15 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
+from app.google_runtime import resolve_google_credentials_file, resolve_google_token_file
+
 # API Scopes for Gmail (Read/Modify) and Google Sheets (Read/Write)
 SCOPES = [
     'https://www.googleapis.com/auth/gmail.modify',
     'https://www.googleapis.com/auth/spreadsheets'
 ]
-TOKEN_FILE = 'stage1_token.json'
-CREDENTIALS_FILE = 'credentials.json'
+TOKEN_FILE = resolve_google_token_file("stage1_token.json", use_file_env=False)
+CREDENTIALS_FILE = resolve_google_credentials_file("credentials.json")
 
 # The ID of the bid_board_emails Google Sheet
 SPREADSHEET_ID = '1mhCWXwSUtV-AbBxLmEBS-jezkeujVPMYY9RD5ENlPFU'

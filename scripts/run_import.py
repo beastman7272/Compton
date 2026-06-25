@@ -25,6 +25,8 @@ from app.importer import import_project_from_source
 from app.models import ImportItem, ImportResult
 from app.search import index_upload_ids
 from app.contact_extraction import extract_contacts_for_upload_ids
+from app import config
+from app.google_runtime import resolve_google_credentials_file, resolve_google_token_file
 
 from dotenv import load_dotenv
 
@@ -36,30 +38,18 @@ def env_value(name: str, default: str) -> str:
     return os.getenv(name, default).strip()
 
 
-def env_path(name: str, default: Path) -> Path:
-    value = os.getenv(name)
-    if not value:
-        return default
-
-    path = Path(value.strip())
-    if path.is_absolute():
-        return path
-
-    return PROJECT_ROOT / path
-
-
 # ── Paths ────────────────────────────────────────────────────────────────
 
-DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "cqe.db"
-DEFAULT_STORAGE_ROOT = PROJECT_ROOT / "data" / "uploads"
-DOWNLOADS = Path.home() / "Downloads"
+DEFAULT_DB_PATH = config.DB_PATH
+DEFAULT_STORAGE_ROOT = config.STORAGE_ROOT
+DOWNLOADS = config.DOWNLOADS_DIR
 
 
 # ── Google Sheets config ─────────────────────────────────────────────────
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-TOKEN_FILE = env_path("GOOGLE_TOKEN_FILE", PROJECT_ROOT / "orchestrator_token.json")
-CREDENTIALS_FILE = env_path("GOOGLE_CREDENTIALS_FILE", PROJECT_ROOT / "credentials.json")
+TOKEN_FILE = resolve_google_token_file("orchestrator_token.json")
+CREDENTIALS_FILE = resolve_google_credentials_file("credentials.json")
 
 # BuildingConnected / Bid Board sheet
 BC_SHEET_ID = env_value("BID_BOARD_SHEET_ID", "14PMQx_SiNkSX2gLWtfjsIEpovmADJpv1f53bhICQKfY")

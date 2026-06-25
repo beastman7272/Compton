@@ -8,10 +8,11 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.config import STORAGE_ROOT
 from app.models import ImportItem, StoredPdf
 
 
-DEFAULT_STORAGE_ROOT = Path("data") / "uploads"
+DEFAULT_STORAGE_ROOT = STORAGE_ROOT
 SPLIT_PDF_MERGE_MIN_FILES = 25
 SPLIT_PDF_SINGLE_PAGE_RATIO = 0.85
 

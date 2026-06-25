@@ -16,14 +16,17 @@ from googleapiclient.discovery import build
 from dotenv import load_dotenv
 from playwright.sync_api import Download, Locator, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
+from app import config
+from app.google_runtime import resolve_google_credentials_file, resolve_google_token_file
+
 SPREADSHEET_ID = "1vqEd71BGHNMDJdBcymM4cgGzEQhlXsib3sFXY9Qlt7U"
-CREDENTIALS_FILE = "credentials.json"
-TOKEN_FILE = "token.json"
+CREDENTIALS_FILE = resolve_google_credentials_file("credentials.json")
+TOKEN_FILE = resolve_google_token_file("token.json", use_file_env=False)
 
 SEARCH_URL = "https://insight.cmdgroup.com/SearchResult/ProjectSearchResult/Index"
-DOWNLOAD_DIR = Path.home() / "Downloads"
-HEADLESS = False
-PROFILE_DIR = Path("playwright_cc_profile")
+DOWNLOAD_DIR = config.DOWNLOADS_DIR
+HEADLESS = config.env_bool("CQE_PLAYWRIGHT_HEADLESS", False)
+PROFILE_DIR = config.CC_PLAYWRIGHT_PROFILE_DIR
 LOGIN_REQUIRED_MESSAGE = (
     "ConstructConnect login required. Open the Playwright browser profile, "
     "log in to ConstructConnect, or configure CONSTRUCTCONNECT_USERNAME and "

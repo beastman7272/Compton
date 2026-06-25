@@ -14,6 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from app.config import DB_PATH
 from app.db import get_connection
 from app.pdf_text import extract_first_pages_text
 
@@ -325,7 +326,7 @@ def extract_contacts_for_upload(
 
 def extract_contacts_for_upload_ids(
     upload_ids: list[int],
-    db_path: Path | str = Path("data") / "cqe.db",
+    db_path: Path | str = DB_PATH,
     max_pages: int = 10,
 ) -> None:
     """
@@ -353,7 +354,7 @@ def extract_contacts_for_upload_ids(
 
 
 def extract_contacts_for_indexed_uploads(
-    db_path: Path | str = Path("data") / "cqe.db",
+    db_path: Path | str = DB_PATH,
     max_uploads: int | None = None,
     max_pages: int = 10,
 ) -> None:

@@ -10,12 +10,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from app import config  # noqa: E402
 from scripts.run_import import run_import, print_summary  # noqa: E402
 
 
-DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "cqe.db"
-DEFAULT_STORAGE_ROOT = PROJECT_ROOT / "data" / "uploads"
-DEFAULT_DOWNLOADS_DIR = Path.home() / "Downloads"
+DEFAULT_DB_PATH = config.DB_PATH
+DEFAULT_STORAGE_ROOT = config.STORAGE_ROOT
+DEFAULT_DOWNLOADS_DIR = config.DOWNLOADS_DIR
 
 
 def main() -> int:

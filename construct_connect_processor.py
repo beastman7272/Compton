@@ -15,10 +15,12 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google_auth_oauthlib.flow import InstalledAppFlow
 
+from app.google_runtime import resolve_google_credentials_file, resolve_google_token_file
+
 # --- Config ---
 SPREADSHEET_ID = "1vqEd71BGHNMDJdBcymM4cgGzEQhlXsib3sFXY9Qlt7U"
-CREDENTIALS_FILE = "credentials.json"
-TOKEN_FILE = "token.json"
+CREDENTIALS_FILE = resolve_google_credentials_file("credentials.json")
+TOKEN_FILE = resolve_google_token_file("token.json", use_file_env=False)
 
 EMAIL_FROM = "beastman7272@gmail.com"
 
