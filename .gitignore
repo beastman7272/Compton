@@ -31,3 +31,5 @@ playwright_results.json
 
 # Ignore generated workflow logs
 logs/
+
+data/uploads/
