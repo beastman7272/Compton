@@ -32,19 +32,13 @@ from datetime import datetime
 from difflib import SequenceMatcher
 
 from app import config
-from app.google_runtime import resolve_google_credentials_file, resolve_google_token_file
+from app.google_runtime import build_sheets_service
 
 try:
-    from google.auth.exceptions import RefreshError
-    from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    from google.auth.transport.requests import Request
-    from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
 except ImportError:
-    print("Missing dependencies. Run:")
-    print("  pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client")
-    sys.exit(1)
+    class HttpError(Exception):
+        """Fallback so import-only checks can run without Google API packages."""
 
 
 def configure_text_io():
@@ -83,8 +77,6 @@ configure_text_io()
 
 # ── Config ────────────────────────────────────────────────────────────────
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-TOKEN_FILE = resolve_google_token_file("orchestrator_token.json", use_file_env=False)
-CREDENTIALS_FILE = resolve_google_credentials_file("credentials.json")
 
 def env_value(name, default):
     return os.getenv(name, default).strip()
@@ -131,28 +123,10 @@ SKIP_FILE_KEYWORDS = SKIP_FOLDER_KEYWORDS + [
 
 # ── Auth ──────────────────────────────────────────────────────────────────
 def get_sheets_service():
-    creds = None
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except RefreshError:
-                if os.path.exists(TOKEN_FILE):
-                    os.remove(TOKEN_FILE)
-                creds = None
-
-        if not creds or not creds.valid:
-            if not os.path.exists(CREDENTIALS_FILE):
-                print(f"ERROR: {CREDENTIALS_FILE} not found.")
-                print("Download OAuth credentials from Google Cloud Console.")
-                sys.exit(1)
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open_utf8(TOKEN_FILE, "w") as token:
-            token.write(creds.to_json())
-    return build("sheets", "v4", credentials=creds)
+    return build_sheets_service(
+        SCOPES,
+        token_filename="orchestrator_token.json",
+    )
 
 
 # ── Sheet helpers ─────────────────────────────────────────────────────────

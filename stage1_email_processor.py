@@ -4,21 +4,13 @@ import re
 import html
 from datetime import datetime
 
-from google.auth.exceptions import RefreshError
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-
-from app.google_runtime import resolve_google_credentials_file, resolve_google_token_file
+from app.google_runtime import build_oauth_services
 
 # API Scopes for Gmail (Read/Modify) and Google Sheets (Read/Write)
 SCOPES = [
     'https://www.googleapis.com/auth/gmail.modify',
     'https://www.googleapis.com/auth/spreadsheets'
 ]
-TOKEN_FILE = resolve_google_token_file("stage1_token.json", use_file_env=False)
-CREDENTIALS_FILE = resolve_google_credentials_file("credentials.json")
 
 # The ID of the bid_board_emails Google Sheet
 def env_value(name, default):
@@ -31,33 +23,14 @@ COLUMNS_RANGE = 'A:E'
 
 def authenticate_google_services():
     """Authenticates and returns the Gmail and Sheets service objects."""
-    creds = None
-    # Use a dedicated token so this script's Gmail scope is not overwritten
-    # by other scripts that only request Google Sheets permissions.
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-    
-    # If there are no (valid) credentials available, let the user log in.
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except RefreshError:
-                if os.path.exists(TOKEN_FILE):
-                    os.remove(TOKEN_FILE)
-                creds = None
-
-        if not creds or not creds.valid:
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-        # Save the credentials for the next run
-        with open(TOKEN_FILE, 'w') as token:
-            token.write(creds.to_json())
-
-    gmail_service = build('gmail', 'v1', credentials=creds)
-    sheets_service = build('sheets', 'v4', credentials=creds)
-    
-    return gmail_service, sheets_service
+    # Gmail access must use OAuth user credentials; the same token can also
+    # write to Sheets because this workflow consumes Gmail and appends rows.
+    return build_oauth_services(
+        ("gmail", "sheets"),
+        SCOPES,
+        token_filename="stage1_token.json",
+        use_file_env=False,
+    )
 
 def get_sheet_range(sheets_service):
     """Returns a valid A:E range for the preferred sheet or the first tab."""

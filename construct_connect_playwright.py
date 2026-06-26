@@ -8,24 +8,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from google.auth.exceptions import RefreshError
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
 from dotenv import load_dotenv
 from playwright.sync_api import Download, Locator, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 from app import config
-from app.google_runtime import resolve_google_credentials_file, resolve_google_token_file
+from app.google_runtime import build_sheets_service
 
 def env_value(name: str, default: str) -> str:
     return os.getenv(name, default).strip()
 
 
 SPREADSHEET_ID = env_value("CONSTRUCTCONNECT_SHEET_ID", "1vqEd71BGHNMDJdBcymM4cgGzEQhlXsib3sFXY9Qlt7U")
-CREDENTIALS_FILE = resolve_google_credentials_file("credentials.json")
-TOKEN_FILE = resolve_google_token_file("token.json", use_file_env=False)
 
 SEARCH_URL = "https://insight.cmdgroup.com/SearchResult/ProjectSearchResult/Index"
 DOWNLOAD_DIR = config.DOWNLOADS_DIR
@@ -51,7 +44,6 @@ MANUFACTURER_DAYS = {
 WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
@@ -88,29 +80,6 @@ class ConstructConnectProjectNotFound(RuntimeError):
     """Raised when a project search returns no matching ConstructConnect project."""
 
 
-def get_creds() -> Credentials:
-    creds = None
-
-    if Path(TOKEN_FILE).exists():
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except RefreshError:
-                Path(TOKEN_FILE).unlink(missing_ok=True)
-                creds = None
-
-        if not creds or not creds.valid:
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-
-        Path(TOKEN_FILE).write_text(creds.to_json(), encoding="utf-8")
-
-    return creds
-
-
 def clean(value: object) -> str:
     if value is None:
         return ""
@@ -118,8 +87,7 @@ def clean(value: object) -> str:
 
 
 def get_sheets_service():
-    creds = get_creds()
-    return build("sheets", "v4", credentials=creds)
+    return build_sheets_service(SCOPES, token_filename="token.json")
 
 
 def sheet_range(tab_name: str, range_name: str) -> str:

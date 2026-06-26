@@ -8,14 +8,8 @@ import os
 from pathlib import Path
 
 import pandas as pd
-from google.auth.exceptions import RefreshError
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-from google_auth_oauthlib.flow import InstalledAppFlow
 
-from app.google_runtime import resolve_google_credentials_file, resolve_google_token_file
+from app.google_runtime import load_oauth_credentials
 
 # --- Config ---
 def env_value(name: str, default: str) -> str:
@@ -23,8 +17,6 @@ def env_value(name: str, default: str) -> str:
 
 
 SPREADSHEET_ID = env_value("CONSTRUCTCONNECT_SHEET_ID", "1vqEd71BGHNMDJdBcymM4cgGzEQhlXsib3sFXY9Qlt7U")
-CREDENTIALS_FILE = resolve_google_credentials_file("credentials.json")
-TOKEN_FILE = resolve_google_token_file("token.json", use_file_env=False)
 
 EMAIL_FROM = "beastman7272@gmail.com"
 
@@ -56,30 +48,14 @@ SKIP_BRANDS = []
 # ]
 
 
-def get_creds() -> Credentials:
-    creds = None
-
-    if Path(TOKEN_FILE).exists():
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-        if not creds.has_scopes(SCOPES):
-            Path(TOKEN_FILE).unlink(missing_ok=True)
-            creds = None
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except RefreshError:
-                Path(TOKEN_FILE).unlink(missing_ok=True)
-                creds = None
-
-        if not creds or not creds.valid:
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-
-        Path(TOKEN_FILE).write_text(creds.to_json(), encoding="utf-8")
-
-    return creds
+def get_creds():
+    # Gmail access must use OAuth user credentials. This token also writes to
+    # Sheets because this Gmail workflow appends imported rows.
+    return load_oauth_credentials(
+        SCOPES,
+        token_filename="token.json",
+        use_file_env=False,
+    )
 
 
 def normalize_text(value: object) -> str:
@@ -313,6 +289,8 @@ def main():
         return
 
     creds = get_creds()
+    from googleapiclient.discovery import build
+
     gmail_service = build("gmail", "v1", credentials=creds)
     sheets_service = build("sheets", "v4", credentials=creds)
 
