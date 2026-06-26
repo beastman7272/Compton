@@ -19,7 +19,11 @@ from playwright.sync_api import Download, Locator, Page, TimeoutError as Playwri
 from app import config
 from app.google_runtime import resolve_google_credentials_file, resolve_google_token_file
 
-SPREADSHEET_ID = "1vqEd71BGHNMDJdBcymM4cgGzEQhlXsib3sFXY9Qlt7U"
+def env_value(name: str, default: str) -> str:
+    return os.getenv(name, default).strip()
+
+
+SPREADSHEET_ID = env_value("CONSTRUCTCONNECT_SHEET_ID", "1vqEd71BGHNMDJdBcymM4cgGzEQhlXsib3sFXY9Qlt7U")
 CREDENTIALS_FILE = resolve_google_credentials_file("credentials.json")
 TOKEN_FILE = resolve_google_token_file("token.json", use_file_env=False)
 

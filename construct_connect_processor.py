@@ -18,7 +18,11 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from app.google_runtime import resolve_google_credentials_file, resolve_google_token_file
 
 # --- Config ---
-SPREADSHEET_ID = "1vqEd71BGHNMDJdBcymM4cgGzEQhlXsib3sFXY9Qlt7U"
+def env_value(name: str, default: str) -> str:
+    return os.getenv(name, default).strip()
+
+
+SPREADSHEET_ID = env_value("CONSTRUCTCONNECT_SHEET_ID", "1vqEd71BGHNMDJdBcymM4cgGzEQhlXsib3sFXY9Qlt7U")
 CREDENTIALS_FILE = resolve_google_credentials_file("credentials.json")
 TOKEN_FILE = resolve_google_token_file("token.json", use_file_env=False)
 

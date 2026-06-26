@@ -21,8 +21,12 @@ TOKEN_FILE = resolve_google_token_file("stage1_token.json", use_file_env=False)
 CREDENTIALS_FILE = resolve_google_credentials_file("credentials.json")
 
 # The ID of the bid_board_emails Google Sheet
-SPREADSHEET_ID = '1mhCWXwSUtV-AbBxLmEBS-jezkeujVPMYY9RD5ENlPFU'
-PREFERRED_SHEET_NAME = 'bid_board_emails'
+def env_value(name, default):
+    return os.getenv(name, default).strip()
+
+
+SPREADSHEET_ID = env_value('EMAILS_SHEET_ID', '1mhCWXwSUtV-AbBxLmEBS-jezkeujVPMYY9RD5ENlPFU')
+PREFERRED_SHEET_NAME = env_value('EMAILS_TAB_NAME', 'bid_board_emails')
 COLUMNS_RANGE = 'A:E'
 
 def authenticate_google_services():
