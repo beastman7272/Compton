@@ -8,7 +8,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 COPY requirements.txt .
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends xvfb \
+    && apt-get install -y --no-install-recommends \
+        fluxbox \
+        novnc \
+        websockify \
+        x11vnc \
+        xvfb \
     && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir -r requirements.txt
 RUN python -m playwright install chromium
