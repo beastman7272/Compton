@@ -7,6 +7,8 @@ ENV PYTHONUNBUFFERED=1 \
     CQE_USE_XVFB=1
 
 COPY requirements.txt .
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Etc/UTC
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         fluxbox \
