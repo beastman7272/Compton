@@ -79,10 +79,17 @@ CQE_RUNTIME_CREDENTIALS_DIR
 BC_PLAYWRIGHT_PROFILE_DIR
 CC_PLAYWRIGHT_PROFILE_DIR
 CQE_WORKFLOW_LOCK_FILE
+CQE_PLAYWRIGHT_BROWSER
 CQE_PLAYWRIGHT_HEADLESS
 CQE_USE_XVFB
 DAILY_WORKFLOW_TOKEN
 ```
+
+Set `CQE_PLAYWRIGHT_BROWSER=chromium` on Railway if you need to override the
+hosted default explicitly. The Docker image installs bundled Chromium only
+(`playwright install chromium`), matching the bootstrap profile at
+`/app/data/playwright_bc_profile/chromium`. Local development defaults to
+`chrome` when unset.
 
 Default Railway paths with `/app/data`:
 

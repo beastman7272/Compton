@@ -692,13 +692,15 @@ def apply_result(service, task, result, bb_data):
 def phase2_playwright_run(
     service,
     *,
-    browser="chrome",
+    browser=None,
     cdp_url=None,
     headless=False,
     select_files=False,
     download_files=False,
     apply_results=False,
 ):
+    if browser is None:
+        browser = config.default_playwright_browser()
     print("\n" + "=" * 70)
     print("PHASE 2 — Playwright: process BuildingConnected browser tasks")
     print("=" * 70)
@@ -812,7 +814,9 @@ def phase2_playwright_run(
     return True
 
 
-def check_buildingconnected_login(*, browser="chrome", cdp_url=None, headless=False):
+def check_buildingconnected_login(*, browser=None, cdp_url=None, headless=False):
+    if browser is None:
+        browser = config.default_playwright_browser()
     print("\n" + "=" * 70)
     print("BUILDINGCONNECTED LOGIN CHECK")
     print("=" * 70)
@@ -907,7 +911,8 @@ def main():
     parser.add_argument("--check-buildingconnected-login", action="store_true",
                         help="Open the Playwright profile and verify BuildingConnected is logged in")
     parser.add_argument("--playwright-browser", choices=["auto", "chrome", "msedge", "chromium"],
-                        default="chrome", help="Browser channel for Playwright runs")
+                        default=config.default_playwright_browser(),
+                        help="Browser channel for Playwright runs")
     parser.add_argument("--playwright-cdp-url",
                         help="Attach Playwright to an existing Chrome/Edge debugging session")
     parser.add_argument("--playwright-headless", action="store_true",
@@ -920,8 +925,9 @@ def main():
                         help="Apply Playwright results to Sheets and clear run_state.json")
     args = parser.parse_args()
 
+    default_browser = config.default_playwright_browser()
     playwright_flag_without_run = (
-        args.playwright_browser != "chrome"
+        args.playwright_browser != default_browser
         or args.playwright_cdp_url
         or args.playwright_headless
         or args.playwright_select_files

@@ -75,10 +75,18 @@ def build_steps(args: argparse.Namespace) -> list[WorkflowStep]:
     if args.no_sheet_update:
         import_args.append("--no-sheet-update")
 
+    bc_browser_args = ["--playwright-browser", config.default_playwright_browser()]
+
     return [
         WorkflowStep(
             name="BuildingConnected login check",
-            command=[python, "-u", "bid_board_orchestrator.py", "--check-buildingconnected-login"],
+            command=[
+                python,
+                "-u",
+                "bid_board_orchestrator.py",
+                "--check-buildingconnected-login",
+                *bc_browser_args,
+            ],
             needs_xvfb=True,
         ),
         WorkflowStep(
@@ -96,7 +104,13 @@ def build_steps(args: argparse.Namespace) -> list[WorkflowStep]:
         ),
         WorkflowStep(
             name="BuildingConnected workflow",
-            command=[python, "-u", "bid_board_orchestrator.py", "--run-playwright-workflow"],
+            command=[
+                python,
+                "-u",
+                "bid_board_orchestrator.py",
+                "--run-playwright-workflow",
+                *bc_browser_args,
+            ],
             needs_xvfb=True,
         ),
         WorkflowStep(

@@ -97,6 +97,27 @@ PLAYWRIGHT_RESULTS_FILE = _path_from_env(
     DATA_ROOT / "playwright_results.json" if HOSTED_RUNTIME else PROJECT_ROOT / "playwright_results.json",
 )
 
+_PLAYWRIGHT_BROWSER_CHOICES = frozenset({"auto", "chrome", "msedge", "chromium"})
+
+
+def default_playwright_browser() -> str:
+    """
+    Default BuildingConnected Playwright browser channel.
+
+    Railway/hosted images install bundled Chromium only; local dev typically uses
+    installed Chrome unless overridden.
+    """
+    value = _clean_env("CQE_PLAYWRIGHT_BROWSER")
+    if value:
+        normalized = value.lower()
+        if normalized not in _PLAYWRIGHT_BROWSER_CHOICES:
+            allowed = ", ".join(sorted(_PLAYWRIGHT_BROWSER_CHOICES))
+            raise ValueError(f"CQE_PLAYWRIGHT_BROWSER must be one of: {allowed}")
+        return normalized
+    if HOSTED_RUNTIME:
+        return "chromium"
+    return "chrome"
+
 
 def resolve_project_path(path: Path | str) -> Path:
     candidate = Path(path)
