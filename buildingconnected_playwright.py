@@ -33,6 +33,7 @@ BODY_TEXT_PROBE_TIMEOUT_MS = 1_500
 NAV_TIMEOUT_MS = 120_000
 DOWNLOAD_TIMEOUT_MS = 180_000
 HOSTED_PIPELINE_READY_TIMEOUT_MS = 45_000
+HOSTED_PIPELINE_STABILITY_MS = 7_000
 LOCAL_PIPELINE_READY_TIMEOUT_MS = 12_000
 HOSTED_UNDECIDED_TAB_TIMEOUT_MS = 15_000
 LOCAL_UNDECIDED_TAB_TIMEOUT_MS = 8_000
@@ -352,6 +353,27 @@ def wait_for_pipeline_ready(page: Page, *, timeout_ms: int | None = None) -> Non
     raise PlaywrightTimeoutError(f"Pipeline not ready within {timeout_ms}ms")
 
 
+def wait_for_pipeline_stability(page: Page) -> None:
+    """Ensure hosted Chromium survives the initial BC SPA hydration window."""
+    if not config.HOSTED_RUNTIME:
+        return
+
+    deadline = time.monotonic() + (HOSTED_PIPELINE_STABILITY_MS / 1000)
+    while time.monotonic() < deadline:
+        # A crashed renderer can still expose page.url; evaluate forces a round trip
+        # to the renderer and raises PlaywrightError when the target has crashed.
+        page.evaluate("document.readyState")
+        remaining_ms = int(max(0, (deadline - time.monotonic()) * 1000))
+        page.wait_for_timeout(min(PIPELINE_READY_POLL_MS, remaining_ms))
+
+    ready, reason = pipeline_is_ready(page)
+    if not ready:
+        raise PlaywrightTimeoutError(
+            "Pipeline stopped being ready during the hosted stability check"
+        )
+    log(f"Pipeline remained stable via {reason} for {HOSTED_PIPELINE_STABILITY_MS}ms")
+
+
 def navigate_to_pipeline(page: Page, *, non_interactive: bool = False) -> None:
     try:
         page.goto(START_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
@@ -438,6 +460,7 @@ def ensure_pipeline(page: Page, *, non_interactive: bool = False) -> None:
     navigate_to_pipeline(page, non_interactive=non_interactive)
 
     if click_undecided_tab(page, non_interactive=non_interactive):
+        wait_for_pipeline_stability(page)
         return
 
     if looks_like_login_page(page):
@@ -446,6 +469,7 @@ def ensure_pipeline(page: Page, *, non_interactive: bool = False) -> None:
         pause_for_user(LOGIN_REQUIRED_MESSAGE)
         navigate_to_pipeline(page, non_interactive=non_interactive)
         if click_undecided_tab(page, non_interactive=non_interactive):
+            wait_for_pipeline_stability(page)
             return
 
     if non_interactive:
@@ -1675,7 +1699,7 @@ def page_is_unusable(page: Page, result: dict[str, object] | None = None) -> boo
             return True
 
     try:
-        _ = page.url
+        page.evaluate("document.readyState")
     except Exception:
         return True
     return False

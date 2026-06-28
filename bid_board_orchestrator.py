@@ -27,6 +27,7 @@ import os
 import sys
 import re
 import argparse
+import contextlib
 import json
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -734,6 +735,7 @@ def phase2_playwright_run(
             attach_context,
             launch_context,
             open_fresh_page,
+            page_is_unusable,
             process_project,
         )
     except ImportError as exc:
@@ -766,6 +768,28 @@ def phase2_playwright_run(
                     non_interactive=True,
                     reuse_current_page=False,
                 )
+
+                if (
+                    not cdp_url
+                    and config.HOSTED_RUNTIME
+                    and result.get("status") == "ERROR"
+                    and page_is_unusable(page, result)
+                ):
+                    print("  Browser target crashed; retrying task once in a fresh browser context")
+                    with contextlib.suppress(Exception):
+                        context.close()
+                    context = launch_context(pw, browser, headless)
+                    context.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+                    page = context.pages[0] if context.pages else context.new_page()
+                    result = process_project(
+                        page,
+                        project,
+                        select_files=select_files or download_files,
+                        download_files=download_files,
+                        non_interactive=True,
+                        reuse_current_page=False,
+                    )
+
                 results.append({"task": task, "result": result})
 
                 status = result.get("status", "ERROR")
@@ -777,8 +801,16 @@ def phase2_playwright_run(
                 if result.get("error"):
                     print(f"  Error: {result['error']}")
                 if result.get("status") == "ERROR" and idx < len(tasks):
-                    print("  Recovering with a fresh browser page before next task (prior ERROR)")
-                    page = open_fresh_page(context, page)
+                    if not cdp_url and config.HOSTED_RUNTIME and page_is_unusable(page, result):
+                        print("  Recovering with a fresh browser context before next task")
+                        with contextlib.suppress(Exception):
+                            context.close()
+                        context = launch_context(pw, browser, headless)
+                        context.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+                        page = context.pages[0] if context.pages else context.new_page()
+                    else:
+                        print("  Recovering with a fresh browser page before next task (prior ERROR)")
+                        page = open_fresh_page(context, page)
         finally:
             if not cdp_url:
                 context.close()
