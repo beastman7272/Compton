@@ -733,6 +733,8 @@ def phase2_playwright_run(
             NAV_TIMEOUT_MS,
             attach_context,
             launch_context,
+            open_fresh_page,
+            page_is_unusable,
             process_project,
         )
     except ImportError as exc:
@@ -775,6 +777,9 @@ def phase2_playwright_run(
                     print(f"  Download: {result['download_path']}")
                 if result.get("error"):
                     print(f"  Error: {result['error']}")
+                if page_is_unusable(page, result) and idx < len(tasks):
+                    print("  Recovering with a fresh browser page before next task")
+                    page = open_fresh_page(context, page)
         finally:
             if not cdp_url:
                 context.close()

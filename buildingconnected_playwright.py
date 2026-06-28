@@ -22,6 +22,11 @@ DEFAULT_PROJECT = "Lee County General Services Building Expansion"
 LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled", "--start-maximized"]
 NAV_TIMEOUT_MS = 120_000
 DOWNLOAD_TIMEOUT_MS = 180_000
+HOSTED_PIPELINE_READY_TIMEOUT_MS = 45_000
+LOCAL_PIPELINE_READY_TIMEOUT_MS = 12_000
+HOSTED_UNDECIDED_TAB_TIMEOUT_MS = 15_000
+LOCAL_UNDECIDED_TAB_TIMEOUT_MS = 8_000
+HOSTED_VIEWPORT = {"width": 1440, "height": 1000}
 LOG_ENABLED = True
 LOGIN_REQUIRED_MESSAGE = (
     "BuildingConnected login/MFA required. Open the Playwright browser profile, "
@@ -155,15 +160,46 @@ def click_text_if_visible(page: Page, text: str, timeout: int = 8_000) -> bool:
         return False
 
 
-def open_pipeline(page: Page, *, non_interactive: bool = False) -> None:
+def pipeline_ready_timeout_ms() -> int:
+    return HOSTED_PIPELINE_READY_TIMEOUT_MS if config.HOSTED_RUNTIME else LOCAL_PIPELINE_READY_TIMEOUT_MS
+
+
+def undecided_tab_timeout_ms() -> int:
+    return HOSTED_UNDECIDED_TAB_TIMEOUT_MS if config.HOSTED_RUNTIME else LOCAL_UNDECIDED_TAB_TIMEOUT_MS
+
+
+def wait_for_pipeline_ready(page: Page, *, timeout_ms: int | None = None) -> None:
+    timeout_ms = timeout_ms or pipeline_ready_timeout_ms()
+    ready_marker = page.get_by_role("tab", name=re.compile(r"Undecided", re.I)).or_(
+        page.get_by_text("Bid Board", exact=False)
+    )
+    ready_marker.first.wait_for(state="visible", timeout=timeout_ms)
+    log(f"Pipeline ready marker visible (timeout={timeout_ms}ms)")
+
+
+def navigate_to_pipeline(page: Page, *, non_interactive: bool = False) -> None:
     try:
-        page.goto(START_URL, wait_until="commit", timeout=NAV_TIMEOUT_MS)
+        page.goto(START_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     except PlaywrightTimeoutError:
         if non_interactive:
             raise BuildingConnectedLoginRequired(LOGIN_REQUIRED_MESSAGE)
         pause_for_user("Timed out opening BuildingConnected. The browser may be waiting on Autodesk login.")
+        return
 
-    page.wait_for_timeout(3_000)
+    try:
+        wait_for_pipeline_ready(page)
+    except PlaywrightTimeoutError:
+        if looks_like_login_page(page):
+            if non_interactive:
+                raise BuildingConnectedLoginRequired(LOGIN_REQUIRED_MESSAGE)
+            pause_for_user(LOGIN_REQUIRED_MESSAGE)
+            return
+        if non_interactive:
+            raise RuntimeError(
+                "BuildingConnected pipeline did not finish loading. "
+                "Login/MFA may be required, or the Bid Board UI may have changed."
+            )
+        pause_for_user("BuildingConnected pipeline did not finish loading.")
 
     if looks_like_login_page(page):
         if non_interactive:
@@ -171,27 +207,73 @@ def open_pipeline(page: Page, *, non_interactive: bool = False) -> None:
         pause_for_user(LOGIN_REQUIRED_MESSAGE)
 
 
+def click_undecided_tab(page: Page, *, non_interactive: bool = False) -> bool:
+    per_strategy_timeout = undecided_tab_timeout_ms()
+    retry_delay_ms = 1_500
+    strategies = [
+        ("role_tab", lambda: page.get_by_role("tab", name=re.compile(r"Undecided", re.I)).first),
+        (
+            "tab_locator",
+            lambda: page.locator("[role='tab']").filter(
+                has_text=re.compile(r"Undecided", re.I)
+            ).first,
+        ),
+        ("text_undecided", lambda: page.get_by_text(re.compile(r"^Undecided$", re.I)).first),
+    ]
+
+    def try_all_strategies(attempt: int) -> str | None:
+        for name, locator_fn in strategies:
+            try:
+                locator = locator_fn()
+                locator.wait_for(state="visible", timeout=per_strategy_timeout)
+                locator.click()
+                page.wait_for_timeout(retry_delay_ms)
+                log(f"Undecided tab clicked via {name} (attempt {attempt})")
+                return name
+            except Exception:
+                continue
+        return None
+
+    if try_all_strategies(1):
+        return True
+
+    page.wait_for_timeout(retry_delay_ms)
+    if try_all_strategies(2):
+        return True
+
+    log("Reloading pipeline URL before final Undecided tab attempt")
+    navigate_to_pipeline(page, non_interactive=non_interactive)
+    return try_all_strategies(3) is not None
+
+
+def open_pipeline(page: Page, *, non_interactive: bool = False) -> None:
+    navigate_to_pipeline(page, non_interactive=non_interactive)
+
+
 def ensure_pipeline(page: Page, *, non_interactive: bool = False) -> None:
     log("Opening BuildingConnected pipeline")
-    open_pipeline(page, non_interactive=non_interactive)
+    navigate_to_pipeline(page, non_interactive=non_interactive)
 
-    if not click_text_if_visible(page, "Undecided", timeout=12_000):
-        if looks_like_login_page(page):
-            if non_interactive:
-                raise BuildingConnectedLoginRequired(LOGIN_REQUIRED_MESSAGE)
-            pause_for_user(LOGIN_REQUIRED_MESSAGE)
-            open_pipeline(page, non_interactive=non_interactive)
-            if click_text_if_visible(page, "Undecided", timeout=12_000):
-                return
+    if click_undecided_tab(page, non_interactive=non_interactive):
+        return
+
+    if looks_like_login_page(page):
         if non_interactive:
-            raise RuntimeError(
-                "Could not reach the BuildingConnected Undecided tab. "
-                "Login/MFA may be required, or the Bid Board UI may have changed."
-            )
-        pause_for_user("Could not click the Undecided tab. Login/MFA may be required.")
-        open_pipeline(page, non_interactive=non_interactive)
-        if not click_text_if_visible(page, "Undecided", timeout=12_000):
-            raise RuntimeError("Could not reach the Undecided bid board.")
+            raise BuildingConnectedLoginRequired(LOGIN_REQUIRED_MESSAGE)
+        pause_for_user(LOGIN_REQUIRED_MESSAGE)
+        navigate_to_pipeline(page, non_interactive=non_interactive)
+        if click_undecided_tab(page, non_interactive=non_interactive):
+            return
+
+    if non_interactive:
+        raise RuntimeError(
+            "Could not reach the BuildingConnected Undecided tab. "
+            "Login/MFA may be required, or the Bid Board UI may have changed."
+        )
+    pause_for_user("Could not click the Undecided tab. Login/MFA may be required.")
+    navigate_to_pipeline(page, non_interactive=non_interactive)
+    if not click_undecided_tab(page, non_interactive=non_interactive):
+        raise RuntimeError("Could not reach the Undecided bid board.")
 
 
 def sort_by_name(page: Page) -> None:
@@ -1354,7 +1436,7 @@ def launch_context(pw, browser: str, headless: bool):
                 "headless": effective_headless,
                 "accept_downloads": True,
                 "args": LAUNCH_ARGS,
-                "viewport": None,
+                "viewport": HOSTED_VIEWPORT if config.HOSTED_RUNTIME else None,
             }
             if channel:
                 kwargs["channel"] = channel
@@ -1386,6 +1468,43 @@ def base_result(project: str) -> dict[str, object]:
         "matched_text": "",
         "error": "",
     }
+
+
+def page_is_unusable(page: Page, result: dict[str, object] | None = None) -> bool:
+    try:
+        if page.is_closed():
+            return True
+    except Exception:
+        return True
+
+    if result and result.get("status") == "ERROR":
+        error = str(result.get("error") or "").lower()
+        crash_markers = (
+            "page crashed",
+            "target closed",
+            "context destroyed",
+            "has been closed",
+            "execution context was destroyed",
+        )
+        if any(marker in error for marker in crash_markers):
+            return True
+
+    try:
+        _ = page.url
+    except Exception:
+        return True
+    return False
+
+
+def open_fresh_page(context, page: Page | None = None) -> Page:
+    if page is not None:
+        with contextlib.suppress(Exception):
+            if not page.is_closed():
+                page.close()
+    fresh = context.new_page()
+    fresh.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+    log("Opened fresh browser page after crash/unusable state")
+    return fresh
 
 
 def process_project(
