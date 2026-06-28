@@ -130,6 +130,11 @@ def get_sheets_service():
 
 
 # ── Sheet helpers ─────────────────────────────────────────────────────────
+def sheet_range(tab_name: str, range_name: str) -> str:
+    escaped_tab_name = tab_name.replace("'", "''")
+    return f"'{escaped_tab_name}'!{range_name}"
+
+
 def read_sheet(service, sheet_id, range_str):
     result = service.spreadsheets().values().get(
         spreadsheetId=sheet_id, range=range_str
