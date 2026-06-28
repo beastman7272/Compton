@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import re
+import time
 from datetime import datetime
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -27,6 +28,8 @@ HOSTED_LAUNCH_ARGS = [
     "--no-sandbox",
 ]
 RECOVERY_UI_TIMEOUT_MS = 2_000
+PIPELINE_READY_POLL_MS = 500
+BODY_TEXT_PROBE_TIMEOUT_MS = 1_500
 NAV_TIMEOUT_MS = 120_000
 DOWNLOAD_TIMEOUT_MS = 180_000
 HOSTED_PIPELINE_READY_TIMEOUT_MS = 45_000
@@ -203,10 +206,43 @@ def dismiss_browser_recovery_ui(page: Page) -> bool:
         except Exception:
             continue
 
+    for label, pattern in button_patterns:
+        try:
+            button = page.locator("button").filter(has_text=pattern).first
+            button.wait_for(state="visible", timeout=RECOVERY_UI_TIMEOUT_MS)
+            button.click()
+            page.wait_for_timeout(500)
+            log(f"Dismissed crash-restore dialog via button filter ({label})")
+            return True
+        except Exception:
+            continue
+
+    text_patterns = [
+        ("restore_text", re.compile(r"^Restore$", re.I)),
+        ("restore_pages_text", re.compile(r"Restore pages", re.I)),
+        ("cancel_text", re.compile(r"^Cancel$", re.I)),
+        ("close_text", re.compile(r"^Close$", re.I)),
+    ]
+    for label, pattern in text_patterns:
+        try:
+            target = page.get_by_text(pattern).first
+            target.wait_for(state="visible", timeout=RECOVERY_UI_TIMEOUT_MS)
+            target.click()
+            page.wait_for_timeout(500)
+            log(f"Dismissed crash-restore dialog via text locator ({label})")
+            return True
+        except Exception:
+            continue
+
     try:
         page.get_by_text(
             re.compile(r"Restore pages|didn['']t shut down correctly|Chromium didn", re.I)
         ).first.wait_for(state="visible", timeout=800)
+        with contextlib.suppress(Exception):
+            page.get_by_text(re.compile(r"^Restore$", re.I)).first.click()
+            page.wait_for_timeout(500)
+            log("Dismissed crash-restore dialog via infobar Restore text")
+            return True
         page.keyboard.press("Escape")
         page.wait_for_timeout(300)
         log("Dismissed crash-restore dialog via Escape")
@@ -216,6 +252,66 @@ def dismiss_browser_recovery_ui(page: Page) -> bool:
 
     with contextlib.suppress(Exception):
         page.keyboard.press("Escape")
+    return False
+
+
+def _locator_visible(locator: Locator, *, timeout_ms: int = 500) -> bool:
+    try:
+        locator.wait_for(state="visible", timeout=timeout_ms)
+        return True
+    except Exception:
+        return False
+
+
+def pipeline_is_ready(page: Page) -> tuple[bool, str]:
+    """Return whether the Bid Board pipeline appears loaded and which check matched."""
+    undecided_tab = page.get_by_role("tab", name=re.compile(r"Undecided", re.I)).first
+    if _locator_visible(undecided_tab):
+        return True, "undecided_tab"
+
+    bid_board_text = page.get_by_text("Bid Board", exact=False).first
+    if _locator_visible(bid_board_text):
+        return True, "bid_board_text"
+
+    try:
+        url = (page.url or "").lower()
+        title = page.title().lower()
+        if "opportunities/pipeline" in url and "bid board" in title:
+            return True, "url_title"
+    except Exception:
+        pass
+
+    undecided_text = page.get_by_text(re.compile(r"Undecided", re.I)).first
+    if _locator_visible(undecided_text):
+        return True, "undecided_text"
+
+    try:
+        body_text = page.locator("body").inner_text(timeout=BODY_TEXT_PROBE_TIMEOUT_MS)
+        if re.search(r"Undecided", body_text, re.I):
+            return True, "body_undecided"
+    except Exception:
+        pass
+
+    return False, ""
+
+
+def is_on_undecided_view(page: Page) -> bool:
+    try:
+        selected_tab = page.locator("[role='tab'][aria-selected='true']").filter(
+            has_text=re.compile(r"Undecided", re.I)
+        ).first
+        if _locator_visible(selected_tab, timeout_ms=800):
+            return True
+    except Exception:
+        pass
+
+    try:
+        tab = page.get_by_role("tab", name=re.compile(r"Undecided", re.I)).first
+        if tab.is_visible() and tab.get_attribute("aria-selected") == "true":
+            return True
+    except Exception:
+        pass
+
     return False
 
 
@@ -243,11 +339,17 @@ def log_pipeline_failure_debug(page: Page, *, reason: str) -> None:
 
 def wait_for_pipeline_ready(page: Page, *, timeout_ms: int | None = None) -> None:
     timeout_ms = timeout_ms or pipeline_ready_timeout_ms()
-    ready_marker = page.get_by_role("tab", name=re.compile(r"Undecided", re.I)).or_(
-        page.get_by_text("Bid Board", exact=False)
-    )
-    ready_marker.first.wait_for(state="visible", timeout=timeout_ms)
-    log(f"Pipeline ready marker visible (timeout={timeout_ms}ms)")
+    deadline = time.monotonic() + (timeout_ms / 1000)
+
+    while time.monotonic() < deadline:
+        ready, reason = pipeline_is_ready(page)
+        if ready:
+            log(f"Pipeline ready via {reason} (timeout budget={timeout_ms}ms)")
+            return
+        remaining_ms = int(max(0, (deadline - time.monotonic()) * 1000))
+        page.wait_for_timeout(min(PIPELINE_READY_POLL_MS, remaining_ms))
+
+    raise PlaywrightTimeoutError(f"Pipeline not ready within {timeout_ms}ms")
 
 
 def navigate_to_pipeline(page: Page, *, non_interactive: bool = False) -> None:
@@ -285,6 +387,10 @@ def navigate_to_pipeline(page: Page, *, non_interactive: bool = False) -> None:
 
 
 def click_undecided_tab(page: Page, *, non_interactive: bool = False) -> bool:
+    if is_on_undecided_view(page):
+        log("Already on Undecided view")
+        return True
+
     per_strategy_timeout = undecided_tab_timeout_ms()
     retry_delay_ms = 1_500
     strategies = [
