@@ -1626,7 +1626,14 @@ def download_selected_files(page: Page) -> Path:
 
 
 def launch_context(pw, browser: str, headless: bool):
-    effective_headless = headless or config.env_bool("CQE_PLAYWRIGHT_HEADLESS", False)
+    # Headed Chromium is unstable for BC under Railway's Xvfb display, while the
+    # same persistent profile is stable with Chromium headless. The noVNC login
+    # bootstrap launches Chromium directly and remains headed for login/MFA.
+    effective_headless = (
+        config.HOSTED_RUNTIME
+        or headless
+        or config.env_bool("CQE_PLAYWRIGHT_HEADLESS", False)
+    )
     channels = {
         "auto": ["chrome", "msedge", None],
         "chrome": ["chrome"],
@@ -1639,7 +1646,8 @@ def launch_context(pw, browser: str, headless: bool):
         try:
             label = channel or "bundled chromium"
             profile_dir = PROFILE_DIR / (channel or "chromium")
-            log(f"Launching {label} with profile {profile_dir}")
+            mode = "headless" if effective_headless else "headed"
+            log(f"Launching {label} {mode} with profile {profile_dir}")
             kwargs = {
                 "user_data_dir": str(profile_dir),
                 "headless": effective_headless,
