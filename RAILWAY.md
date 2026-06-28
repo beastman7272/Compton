@@ -91,6 +91,18 @@ hosted default explicitly. The Docker image installs bundled Chromium only
 `/app/data/playwright_bc_profile/chromium`. Local development defaults to
 `chrome` when unset.
 
+### BuildingConnected Playwright on Railway
+
+Hosted runs launch Chromium with Docker-safe flags (`--disable-dev-shm-usage`,
+`--disable-session-crashed-bubble`, `--no-sandbox`) plus a fixed 1440×1000
+viewport. If a prior run crashed, Chromium may show a **Restore pages?**
+infobar; automation dismisses it before waiting for the Bid Board UI.
+
+When pipeline navigation fails on Railway, debug artifacts are written under
+`CQE_LOG_ROOT/bc-playwright-failures/` (screenshot plus URL/title in logs).
+Phase 2 opens a fresh browser page after any task returns `ERROR` to avoid
+cascade failures on later projects.
+
 Default Railway paths with `/app/data`:
 
 ```text

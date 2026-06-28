@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import re
+from datetime import datetime
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -20,6 +21,12 @@ PROFILE_DIR = config.BC_PLAYWRIGHT_PROFILE_DIR
 DOWNLOAD_DIR = config.DOWNLOADS_DIR
 DEFAULT_PROJECT = "Lee County General Services Building Expansion"
 LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled", "--start-maximized"]
+HOSTED_LAUNCH_ARGS = [
+    "--disable-dev-shm-usage",
+    "--disable-session-crashed-bubble",
+    "--no-sandbox",
+]
+RECOVERY_UI_TIMEOUT_MS = 2_000
 NAV_TIMEOUT_MS = 120_000
 DOWNLOAD_TIMEOUT_MS = 180_000
 HOSTED_PIPELINE_READY_TIMEOUT_MS = 45_000
@@ -168,6 +175,72 @@ def undecided_tab_timeout_ms() -> int:
     return HOSTED_UNDECIDED_TAB_TIMEOUT_MS if config.HOSTED_RUNTIME else LOCAL_UNDECIDED_TAB_TIMEOUT_MS
 
 
+def playwright_launch_args() -> list[str]:
+    args = list(LAUNCH_ARGS)
+    if config.HOSTED_RUNTIME:
+        args.extend(HOSTED_LAUNCH_ARGS)
+    return args
+
+
+def dismiss_browser_recovery_ui(page: Page) -> bool:
+    """Dismiss Chromium 'Restore pages?' infobar if it blocks the Bid Board UI."""
+    button_patterns = [
+        ("restore", re.compile(r"^Restore$", re.I)),
+        ("restore_pages", re.compile(r"Restore pages", re.I)),
+        ("cancel", re.compile(r"^Cancel$", re.I)),
+        ("close", re.compile(r"^Close$", re.I)),
+        ("not_now", re.compile(r"Not now", re.I)),
+        ("dont_restore", re.compile(r"Don'?t restore", re.I)),
+    ]
+    for label, pattern in button_patterns:
+        try:
+            button = page.get_by_role("button", name=pattern).first
+            button.wait_for(state="visible", timeout=RECOVERY_UI_TIMEOUT_MS)
+            button.click()
+            page.wait_for_timeout(500)
+            log(f"Dismissed crash-restore dialog via {label}")
+            return True
+        except Exception:
+            continue
+
+    try:
+        page.get_by_text(
+            re.compile(r"Restore pages|didn['']t shut down correctly|Chromium didn", re.I)
+        ).first.wait_for(state="visible", timeout=800)
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+        log("Dismissed crash-restore dialog via Escape")
+        return True
+    except Exception:
+        pass
+
+    with contextlib.suppress(Exception):
+        page.keyboard.press("Escape")
+    return False
+
+
+def log_pipeline_failure_debug(page: Page, *, reason: str) -> None:
+    if not config.HOSTED_RUNTIME:
+        return
+
+    try:
+        url = page.url
+    except Exception:
+        url = "<unavailable>"
+    try:
+        title = page.title()
+    except Exception:
+        title = "<unavailable>"
+    log(f"Pipeline failure ({reason}): url={url!r} title={title!r}")
+
+    failure_dir = config.LOG_ROOT / "bc-playwright-failures"
+    failure_dir.mkdir(parents=True, exist_ok=True)
+    screenshot_path = failure_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
+    with contextlib.suppress(Exception):
+        page.screenshot(path=str(screenshot_path), full_page=True)
+        log(f"Saved failure screenshot: {screenshot_path}")
+
+
 def wait_for_pipeline_ready(page: Page, *, timeout_ms: int | None = None) -> None:
     timeout_ms = timeout_ms or pipeline_ready_timeout_ms()
     ready_marker = page.get_by_role("tab", name=re.compile(r"Undecided", re.I)).or_(
@@ -186,14 +259,18 @@ def navigate_to_pipeline(page: Page, *, non_interactive: bool = False) -> None:
         pause_for_user("Timed out opening BuildingConnected. The browser may be waiting on Autodesk login.")
         return
 
+    dismiss_browser_recovery_ui(page)
+
     try:
         wait_for_pipeline_ready(page)
     except PlaywrightTimeoutError:
+        dismiss_browser_recovery_ui(page)
         if looks_like_login_page(page):
             if non_interactive:
                 raise BuildingConnectedLoginRequired(LOGIN_REQUIRED_MESSAGE)
             pause_for_user(LOGIN_REQUIRED_MESSAGE)
             return
+        log_pipeline_failure_debug(page, reason="pipeline_ready_timeout")
         if non_interactive:
             raise RuntimeError(
                 "BuildingConnected pipeline did not finish loading. "
@@ -266,6 +343,7 @@ def ensure_pipeline(page: Page, *, non_interactive: bool = False) -> None:
             return
 
     if non_interactive:
+        log_pipeline_failure_debug(page, reason="undecided_tab_unreachable")
         raise RuntimeError(
             "Could not reach the BuildingConnected Undecided tab. "
             "Login/MFA may be required, or the Bid Board UI may have changed."
@@ -273,6 +351,7 @@ def ensure_pipeline(page: Page, *, non_interactive: bool = False) -> None:
     pause_for_user("Could not click the Undecided tab. Login/MFA may be required.")
     navigate_to_pipeline(page, non_interactive=non_interactive)
     if not click_undecided_tab(page, non_interactive=non_interactive):
+        log_pipeline_failure_debug(page, reason="undecided_tab_unreachable")
         raise RuntimeError("Could not reach the Undecided bid board.")
 
 
@@ -1435,7 +1514,7 @@ def launch_context(pw, browser: str, headless: bool):
                 "user_data_dir": str(profile_dir),
                 "headless": effective_headless,
                 "accept_downloads": True,
-                "args": LAUNCH_ARGS,
+                "args": playwright_launch_args(),
                 "viewport": HOSTED_VIEWPORT if config.HOSTED_RUNTIME else None,
             }
             if channel:
