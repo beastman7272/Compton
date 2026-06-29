@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
+import signal
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +29,7 @@ class WorkflowStep:
     name: str
     command: list[str]
     needs_xvfb: bool = False
+    uses_browser: bool = False
 
 
 class WorkflowLogger:
@@ -87,7 +92,9 @@ def build_steps(args: argparse.Namespace) -> list[WorkflowStep]:
                 "--check-buildingconnected-login",
                 *bc_browser_args,
             ],
-            needs_xvfb=True,
+            # Hosted BC is forced headless in buildingconnected_playwright.py.
+            needs_xvfb=not config.HOSTED_RUNTIME,
+            uses_browser=True,
         ),
         WorkflowStep(
             name="ConstructConnect email processor",
@@ -97,6 +104,7 @@ def build_steps(args: argparse.Namespace) -> list[WorkflowStep]:
             name="ConstructConnect Playwright workflow",
             command=[python, "-u", "construct_connect_playwright.py", "--non-interactive", *run_day_args],
             needs_xvfb=True,
+            uses_browser=True,
         ),
         WorkflowStep(
             name="Stage 1 email processor",
@@ -111,7 +119,8 @@ def build_steps(args: argparse.Namespace) -> list[WorkflowStep]:
                 "--run-playwright-workflow",
                 *bc_browser_args,
             ],
-            needs_xvfb=True,
+            needs_xvfb=not config.HOSTED_RUNTIME,
+            uses_browser=True,
         ),
         WorkflowStep(
             name="CQE import workflow",
@@ -145,6 +154,10 @@ def run_step(step: WorkflowStep, logger: WorkflowLogger) -> int:
         text=True,
         encoding="utf-8",
         errors="replace",
+        # Browser processes occasionally outlive Playwright after a renderer
+        # crash. Isolate hosted browser steps so their descendants can be
+        # reaped before the next browser phase starts.
+        start_new_session=config.HOSTED_RUNTIME and step.uses_browser,
     )
 
     assert completed.stdout is not None
@@ -152,11 +165,32 @@ def run_step(step: WorkflowStep, logger: WorkflowLogger) -> int:
         logger.write_raw(line)
 
     return_code = completed.wait()
+    if config.HOSTED_RUNTIME and step.uses_browser:
+        cleanup_browser_process_group(completed.pid, logger)
     if return_code == 0:
         logger.write(f"DONE {step.name}")
     else:
         logger.write(f"FAILED {step.name} exit_code={return_code}")
     return return_code
+
+
+def cleanup_browser_process_group(process_group_id: int, logger: WorkflowLogger) -> None:
+    """Stop browser/Xvfb descendants left behind by a completed hosted step."""
+    if os.name == "nt":
+        return
+
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except PermissionError as exc:
+        logger.write(f"WARNING Could not clean browser process group: {exc}")
+        return
+
+    time.sleep(0.5)
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(process_group_id, signal.SIGKILL)
+    logger.write("Cleaned residual browser processes")
 
 
 def parse_args() -> argparse.Namespace:
