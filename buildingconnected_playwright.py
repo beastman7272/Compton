@@ -1438,7 +1438,6 @@ def select_allowed_files(page: Page) -> list[str]:
 
     root_rows = classified_file_items(page)
     root_names = {name.lower() for _kind, _action, name, _reason in root_rows}
-    selected.extend(select_classified_files(page, root_rows, "root files"))
 
     folders = [
         name
@@ -1448,7 +1447,6 @@ def select_allowed_files(page: Page) -> list[str]:
 
     root_url = page.url
     for folder_name in folders:
-        reset_files_view(page)
         if not open_folder_by_name(page, folder_name):
             print(f"\nSelection Preview ({folder_name}): -- could not open folder --")
             continue
@@ -1460,6 +1458,11 @@ def select_allowed_files(page: Page) -> list[str]:
         ]
         selected.extend(select_classified_files(page, child_rows, folder_name))
         return_to_files_root(page, root_url)
+
+    # Select root files last. Reloading/navigating after selecting them clears
+    # BC's checkbox state and hides the Download Selected control even though
+    # the Python summary still contains the filenames.
+    selected.extend(select_classified_files(page, root_rows, "root files"))
 
     print("\nSelected Files Summary:")
     if selected:
