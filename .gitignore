@@ -14,6 +14,9 @@ playwright_cc_profile/
 playwright_bc_profile/
 chrome_bc_debug/
 
+playwright_bc_profile_chromium_min.zip
+playwright_bc_profile_chrome.zip
+
 #Ignore SQLite db
 data/cqe.db
 

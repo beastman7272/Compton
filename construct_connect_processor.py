@@ -18,7 +18,7 @@ def env_value(name: str, default: str) -> str:
 
 SPREADSHEET_ID = env_value("CONSTRUCTCONNECT_SHEET_ID", "1vqEd71BGHNMDJdBcymM4cgGzEQhlXsib3sFXY9Qlt7U")
 
-EMAIL_FROM = "info@comptonsales.com"
+EMAIL_FROM = "beastman7272@gmail.com"
 
 MANUFACTURER_DAYS = {
     "Citadel": {"monday"},
