@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""
+BuildingConnected Undecided bid-board scanner.
+
+Scans the Undecided bid board directly, filters projects by bid date, and
+(optionally) downloads their documents and appends them to the Bid Board sheet
+so scripts/run_import.py can pick them up.
+
+This replaces the email-driven, search-by-name lookup in bid_board_orchestrator.py,
+which searches the board by project name and fails with NOT FOUND. Here we walk
+the whole board, read the bid date straight off each row, and navigate directly
+to each qualifying row's href -- no name search.
+
+Everything BuildingConnected-specific is reused from buildingconnected_playwright.py;
+this script only adds enumeration, date filtering, and the run loop.
+
+Runtime wiring matches the deployed (railway-deployment-prep) code:
+  * Downloads land in config.DOWNLOADS_DIR, which is DATA_ROOT/downloads on the
+    hosted runtime (CQE_DATA_ROOT=/app/data -> /app/data/downloads) and
+    ~/Downloads locally. buildingconnected_playwright.DOWNLOAD_DIR already points
+    there, so the reused download helpers save to the right place.
+  * The Bid Board sheet is written through scripts/run_import.py's Sheets service,
+    which builds credentials via app.google_runtime.build_sheets_service.
+
+Safe by default: runs as a dry run (lists what it would download, touches nothing)
+unless you pass --no-dry-run. The board holds ~262 projects and individual files
+can be 200MB+, so preview before committing to downloads.
+
+Usage:
+    python bc_board_scan.py                       # dry run, cutoff = next Monday
+    python bc_board_scan.py --after-date 2026-08-01
+    python bc_board_scan.py --limit 5 --no-dry-run --headless
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright
+
+# Make the repo-root modules importable no matter the working directory.
+REPO_ROOT = Path(__file__).resolve().parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from app import config  # noqa: E402
+import buildingconnected_playwright as bc  # noqa: E402
+from buildingconnected_playwright import (  # noqa: E402
+    BidRow,
+    BuildingConnectedLoginRequired,
+    download_selected_files,
+    ensure_pipeline,
+    go_to_next_bid_board_page,
+    launch_context,
+    open_files_tab,
+    reset_bid_board_scroll,
+    row_label,
+    scroll_bid_board,
+    select_allowed_files,
+    visible_bid_rows,
+)
+
+# Guardrails so a broken next-page control can never spin forever.
+MAX_PAGES = 60
+MAX_SCROLLS_PER_PAGE = 500
+STABLE_SCROLLS_TO_STOP = 3
+
+BID_DATE_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b")
+
+
+@dataclass(slots=True)
+class QualifyingProject:
+    name: str
+    bid_date: date
+    bid_date_str: str
+    href: str
+    row: BidRow
+    location: str = ""
+    project_size: str = ""
+    downloaded_files: list[str] = field(default_factory=list)
+    status: str = "pending"  # pending | downloaded | failed
+    error: str = ""
+
+
+def log(message: str) -> None:
+    print(f"[SCAN] {message}")
+
+
+def next_monday(today: date) -> date:
+    """The next Monday strictly after today (if today is Monday, the following one)."""
+    days_ahead = (7 - today.weekday()) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    return today + timedelta(days=days_ahead)
+
+
+def parse_bid_date(text: str) -> tuple[date, str] | None:
+    """Pull the first MM/DD/YYYY out of a row's text and parse it."""
+    match = BID_DATE_RE.search(text or "")
+    if not match:
+        return None
+    raw = match.group(0)
+    try:
+        return datetime.strptime(raw, "%m/%d/%Y").date(), raw
+    except ValueError:
+        return None
+
+
+def row_key(row: BidRow) -> str:
+    """Dedupe key: href when present, else the normalized project label."""
+    href = (row.href or "").strip()
+    if href:
+        return href
+    return "label:" + bc.norm(row_label(row.text))
+
+
+def collect_current_page(page, seen: set[str], collected: list[BidRow]) -> int:
+    """Scroll the current bid-board page, gathering new rows until it stops growing."""
+    added_total = 0
+    stable = 0
+
+    for _ in range(MAX_SCROLLS_PER_PAGE):
+        added = 0
+        for row in visible_bid_rows(page):
+            key = row_key(row)
+            if key in seen:
+                continue
+            seen.add(key)
+            collected.append(row)
+            added += 1
+        added_total += added
+
+        moved = scroll_bid_board(page)
+        stable = 0 if added else stable + 1
+        if not moved or stable >= STABLE_SCROLLS_TO_STOP:
+            break
+
+    return added_total
+
+
+def enumerate_board(page) -> list[BidRow]:
+    """Walk every page of the Undecided board and return deduped rows."""
+    seen: set[str] = set()
+    collected: list[BidRow] = []
+
+    reset_bid_board_scroll(page)
+    for page_no in range(1, MAX_PAGES + 1):
+        added = collect_current_page(page, seen, collected)
+        log(f"Page {page_no}: {added} new rows (running total {len(collected)})")
+
+        if not go_to_next_bid_board_page(page):
+            log("No further bid-board pages.")
+            break
+    else:
+        log(f"Stopped after hitting the {MAX_PAGES}-page cap.")
+
+    return collected
+
+
+def filter_qualifying(
+    rows: list[BidRow], cutoff: date
+) -> tuple[list[QualifyingProject], int]:
+    """Keep rows whose bid date is on or after the cutoff. Returns (qualifying, undated)."""
+    qualifying: list[QualifyingProject] = []
+    undated = 0
+
+    for row in rows:
+        parsed = parse_bid_date(row.text)
+        if parsed is None:
+            undated += 1
+            continue
+        bid_date, raw = parsed
+        if bid_date < cutoff:
+            continue
+        qualifying.append(
+            QualifyingProject(
+                name=row_label(row.text),
+                bid_date=bid_date,
+                bid_date_str=raw,
+                href=(row.href or "").strip(),
+                row=row,
+            )
+        )
+
+    qualifying.sort(key=lambda q: (q.bid_date, q.name.lower()))
+    return qualifying, undated
+
+
+def print_qualifying_table(qualifying: list[QualifyingProject]) -> None:
+    print("\nQualifying projects (bid date >= cutoff):")
+    if not qualifying:
+        print("  -- none --")
+        return
+    for idx, q in enumerate(qualifying, start=1):
+        href = q.href or "(no direct link)"
+        print(f"  {idx:03d}. {q.bid_date_str}  {q.name[:80]:80}  {href}")
+
+
+def download_project(page, q: QualifyingProject) -> None:
+    """Navigate directly to the row's href and download its allowed files."""
+    if not q.href:
+        q.status = "failed"
+        q.error = "Row had no direct href to navigate to."
+        return
+
+    log(f"Opening {q.name} -> {q.href}")
+    page.goto(q.href, wait_until="commit", timeout=bc.NAV_TIMEOUT_MS)
+    page.wait_for_timeout(3_000)
+
+    if bc.looks_like_login_page(page):
+        raise BuildingConnectedLoginRequired(bc.LOGIN_REQUIRED_MESSAGE)
+
+    if not bc.is_project_detail_url(page.url):
+        q.status = "failed"
+        q.error = f"Detail page did not open (landed on {page.url})."
+        return
+
+    details = bc.extract_details(page)
+    q.location = details.get("Location", "") or ""
+    q.project_size = details.get("Project Size", "") or ""
+
+    if not open_files_tab(page):
+        q.status = "failed"
+        q.error = "Files tab was not found/opened."
+        return
+
+    selected = select_allowed_files(page)
+    if not selected:
+        q.status = "failed"
+        q.error = "No eligible files were selected."
+        return
+
+    download_selected_files(page)
+    q.downloaded_files = selected
+    q.status = "downloaded"
+
+
+def append_to_bid_board_sheet(projects: list[QualifyingProject]) -> list[str]:
+    """
+    Append qualifying projects to the Bid Board Google Sheet using the same
+    schema scripts/run_import.py reads (A:G, blank G = import-ready):
+
+        A Project   B Scope   C Location/Address   D Project Size/Budget
+        E Bid Date  F Files   G Status (left blank)
+
+    Existing projects (matched by normalized name) are skipped. Returns the
+    list of project names actually appended.
+
+    Reuses run_import's Sheets service (app.google_runtime.build_sheets_service)
+    and sheet config verbatim so credentials and the schema match the deployed
+    importer. Imported lazily so a dry run never pulls in the import stack.
+    """
+    scripts_dir = REPO_ROOT / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    import run_import as ri  # noqa: E402
+
+    service = ri.get_sheets_service()
+    existing = ri.read_values(
+        service, ri.BC_SHEET_ID, ri.sheet_range(ri.BC_TAB_NAME, "A1:G1000")
+    )
+    existing_names = {
+        bc.norm(ri.clean(row[0]))
+        for row in existing[1:]
+        if row and ri.clean(row[0])
+    }
+
+    new_rows: list[list[str]] = []
+    appended: list[str] = []
+    for q in projects:
+        key = bc.norm(q.name)
+        if not key or key in existing_names:
+            continue
+        existing_names.add(key)
+        appended.append(q.name)
+        new_rows.append(
+            [
+                q.name,                         # A Project
+                "",                             # B Scope
+                q.location,                     # C Location / Address
+                q.project_size,                 # D Project Size / Budget
+                q.bid_date_str,                 # E Bid Date
+                ", ".join(q.downloaded_files),  # F Files
+                "",                             # G Status (blank => import-ready)
+            ]
+        )
+
+    if new_rows:
+        service.spreadsheets().values().append(
+            spreadsheetId=ri.BC_SHEET_ID,
+            range=ri.sheet_range(ri.BC_TAB_NAME, "A1"),
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": new_rows},
+        ).execute()
+
+    return appended
+
+
+def print_summary(
+    *,
+    scanned: int,
+    undated: int,
+    passed: int,
+    downloaded: int,
+    failed: int,
+    appended: list[str] | None,
+    dry_run: bool,
+) -> None:
+    print("\n" + "=" * 70)
+    print("BID BOARD SCAN SUMMARY")
+    print("=" * 70)
+    print(f"Total rows scanned:      {scanned}")
+    print(f"  (undated / skipped):   {undated}")
+    print(f"Passed date filter:      {passed}")
+    if dry_run:
+        print("Downloaded:              0 (dry run -- nothing downloaded)")
+        print("Failed:                  0 (dry run)")
+    else:
+        print(f"Downloaded:              {downloaded}")
+        print(f"Failed:                  {failed}")
+        if appended is not None:
+            print(f"Appended to Bid Board:   {len(appended)}")
+    print("=" * 70)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Scan the BuildingConnected Undecided bid board and download "
+        "documents for projects bidding on or after a cutoff date."
+    )
+    parser.add_argument(
+        "--after-date",
+        metavar="YYYY-MM-DD",
+        help="Cutoff bid date (inclusive). Defaults to next Monday.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="List what would be downloaded without downloading or writing the "
+        "sheet. On by default; pass --no-dry-run to actually download.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        metavar="N",
+        help="Cap the number of qualifying projects processed.",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run the browser headless.",
+    )
+    return parser.parse_args(argv)
+
+
+def resolve_cutoff(after_date: str | None) -> date:
+    if after_date:
+        try:
+            return datetime.strptime(after_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise SystemExit(f"Invalid --after-date {after_date!r}; expected YYYY-MM-DD.")
+    return next_monday(date.today())
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    cutoff = resolve_cutoff(args.after_date)
+
+    log(f"Cutoff bid date (inclusive): {cutoff.isoformat()} ({cutoff:%A})")
+    log(f"Mode: {'DRY RUN (no downloads)' if args.dry_run else 'DOWNLOAD'}")
+    if not args.dry_run:
+        # bc.DOWNLOAD_DIR is already config.DOWNLOADS_DIR; make sure it exists.
+        config.DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        log(f"Downloads will be saved to: {config.DOWNLOADS_DIR}")
+
+    with sync_playwright() as pw:
+        context = launch_context(pw, config.default_playwright_browser(), args.headless)
+        context.set_default_navigation_timeout(bc.NAV_TIMEOUT_MS)
+        page = context.pages[0] if context.pages else context.new_page()
+
+        try:
+            # non_interactive=True so login trouble raises instead of blocking on input().
+            ensure_pipeline(page, non_interactive=True)
+            rows = enumerate_board(page)
+        except BuildingConnectedLoginRequired as exc:
+            print(f"\n{exc}")
+            context.close()
+            return 1
+        except RuntimeError as exc:
+            print(f"\nCould not scan the bid board: {exc}")
+            context.close()
+            return 1
+
+        qualifying, undated = filter_qualifying(rows, cutoff)
+        if args.limit is not None and args.limit >= 0 and len(qualifying) > args.limit:
+            log(f"Limiting to first {args.limit} of {len(qualifying)} qualifying projects.")
+            qualifying = qualifying[: args.limit]
+
+        print_qualifying_table(qualifying)
+
+        if args.dry_run:
+            print_summary(
+                scanned=len(rows),
+                undated=undated,
+                passed=len(qualifying),
+                downloaded=0,
+                failed=0,
+                appended=None,
+                dry_run=True,
+            )
+            context.close()
+            return 0
+
+        downloaded = 0
+        failed = 0
+        login_aborted = False
+        for idx, q in enumerate(qualifying, start=1):
+            log(f"[{idx}/{len(qualifying)}] {q.name} (bid {q.bid_date_str})")
+            try:
+                download_project(page, q)
+            except BuildingConnectedLoginRequired as exc:
+                print(f"\n{exc}")
+                login_aborted = True
+                break
+            except Exception as exc:  # keep going on per-project failures
+                q.status = "failed"
+                q.error = str(exc)
+
+            if q.status == "downloaded":
+                downloaded += 1
+                log(f"  downloaded {len(q.downloaded_files)} file(s)")
+            else:
+                failed += 1
+                log(f"  FAILED: {q.error}")
+
+        # Append everything we attempted (successes and failures alike) so
+        # run_import can pick them up; already-present rows are skipped.
+        processed = [q for q in qualifying if q.status in {"downloaded", "failed"}]
+        appended: list[str] = []
+        if processed:
+            try:
+                appended = append_to_bid_board_sheet(processed)
+                log(f"Appended {len(appended)} new row(s) to the Bid Board sheet.")
+            except Exception as exc:
+                log(f"Could not append to the Bid Board sheet: {exc}")
+
+        print_summary(
+            scanned=len(rows),
+            undated=undated,
+            passed=len(qualifying),
+            downloaded=downloaded,
+            failed=failed,
+            appended=appended,
+            dry_run=False,
+        )
+
+        context.close()
+        return 1 if login_aborted else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
