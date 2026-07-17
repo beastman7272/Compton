@@ -57,6 +57,15 @@
                 </select>
                 <button type="submit">Update</button>
             </form>
+
+            <form method="post"
+                  action="{{ url_for('delete_projects') }}"
+                  class="inline-form dashboard-delete-form"
+                  onsubmit="return confirm('Delete this project? This removes its contacts, uploads, and matches permanently.');">
+                <input type="hidden" name="project_ids" value="{{ project['id'] }}">
+                <input type="hidden" name="next" value="{{ request.full_path }}">
+                <button type="submit" class="button-danger">Delete</button>
+            </form>
         </div>
 
         {% set matches = matches_by_project.get(project["id"], []) %}
