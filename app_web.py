@@ -698,6 +698,10 @@ def create_app() -> Flask:
 
     @app.route("/projects/delete", methods=["POST"])
     def delete_projects():
+        next_url = request.form.get("next", url_for("projects"))
+        if not (next_url.startswith("/") and not next_url.startswith("//")):
+            next_url = url_for("projects")
+
         project_ids: list[int] = []
 
         for raw_project_id in request.form.getlist("project_ids"):
@@ -712,7 +716,7 @@ def create_app() -> Flask:
             project_ids.append(project_id)
 
         if not project_ids:
-            return redirect(url_for("projects"))
+            return redirect(next_url)
 
         project_ids = list(dict.fromkeys(project_ids))
         placeholders = ", ".join("?" for _ in project_ids)
@@ -762,7 +766,7 @@ def create_app() -> Flask:
                 )
                 conn.commit()
 
-        return redirect(url_for("projects"))
+        return redirect(next_url)
 
     @app.route("/projects/<int:project_id>")
     def project_detail(project_id: int):
@@ -948,6 +952,8 @@ def create_app() -> Flask:
     def update_project_status(project_id: int):
         new_status = request.form.get("status", "").strip()
         next_url = request.form.get("next", url_for("project_detail", project_id=project_id))
+        if not (next_url.startswith("/") and not next_url.startswith("//")):
+            next_url = url_for("project_detail", project_id=project_id)
 
         if new_status not in PROJECT_STATUSES:
             abort(400, "Invalid project status")
