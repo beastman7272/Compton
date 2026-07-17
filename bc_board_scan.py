@@ -14,6 +14,14 @@ to each qualifying row's href -- no name search.
 Everything BuildingConnected-specific is reused from buildingconnected_playwright.py;
 this script only adds enumeration, date filtering, and the run loop.
 
+The current Bid Board markup exposes no per-row <a href> (rows navigate via JS),
+so visible_bid_rows returns an empty href for every row. We therefore open each
+qualifying project with open_bid_row -- which uses the href when present and
+otherwise clicks the row by coordinate. Because those coordinates are only valid
+while the row is on screen, the download phase re-scans the live board and clicks
+rows in place (saving/restoring the scroll position to resume) rather than reusing
+the coordinates captured during enumeration.
+
 Runtime wiring matches the deployed (railway-deployment-prep) code:
   * Downloads land in config.DOWNLOADS_DIR, which is DATA_ROOT/downloads on the
     hosted runtime (CQE_DATA_ROOT=/app/data -> /app/data/downloads) and
@@ -56,6 +64,7 @@ from buildingconnected_playwright import (  # noqa: E402
     ensure_pipeline,
     go_to_next_bid_board_page,
     launch_context,
+    open_bid_row,
     open_files_tab,
     reset_bid_board_scroll,
     row_label,
@@ -67,7 +76,10 @@ from buildingconnected_playwright import (  # noqa: E402
 # Guardrails so a broken next-page control can never spin forever.
 MAX_PAGES = 60
 MAX_SCROLLS_PER_PAGE = 500
-STABLE_SCROLLS_TO_STOP = 3
+# Stop scrolling a page only after this many consecutive scans add no new rows.
+# The virtualized board frequently stalls for a beat while lazy-loading, so a
+# single no-movement scroll is not a reliable "end of list" signal.
+STABLE_SCROLLS_TO_STOP = 5
 
 BID_DATE_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b")
 
@@ -121,7 +133,7 @@ def row_key(row: BidRow) -> str:
 def collect_current_page(page, seen: set[str], collected: list[BidRow]) -> int:
     """Scroll the current bid-board page, gathering new rows until it stops growing."""
     added_total = 0
-    stable = 0
+    stall = 0
 
     for _ in range(MAX_SCROLLS_PER_PAGE):
         added = 0
@@ -134,10 +146,13 @@ def collect_current_page(page, seen: set[str], collected: list[BidRow]) -> int:
             added += 1
         added_total += added
 
-        moved = scroll_bid_board(page)
-        stable = 0 if added else stable + 1
-        if not moved or stable >= STABLE_SCROLLS_TO_STOP:
+        # Only "no new rows for several scans in a row" ends the page. Ignore a
+        # single scroll_bid_board() reporting no movement -- keep scrolling so the
+        # board has a chance to lazy-load the rest.
+        stall = 0 if added else stall + 1
+        if stall >= STABLE_SCROLLS_TO_STOP:
             break
+        scroll_bid_board(page)
 
     return added_total
 
@@ -196,20 +211,56 @@ def print_qualifying_table(qualifying: list[QualifyingProject]) -> None:
         print("  -- none --")
         return
     for idx, q in enumerate(qualifying, start=1):
-        href = q.href or "(no direct link)"
-        print(f"  {idx:03d}. {q.bid_date_str}  {q.name[:80]:80}  {href}")
+        # Rows navigate via JS (no per-row href), so the download phase clicks
+        # them in place; only show a link on the rare row that exposes one.
+        suffix = f"  {q.href}" if q.href else ""
+        print(f"  {idx:03d}. {q.bid_date_str}  {q.name[:80]}{suffix}")
 
 
-def download_project(page, q: QualifyingProject) -> None:
-    """Navigate directly to the row's href and download its allowed files."""
-    if not q.href:
+_SCROLL_CONTAINER_JS = """
+  const cands = [...document.querySelectorAll('div, main, section, [role=grid], [role=table]')]
+    .map((el) => ({ el, room: el.scrollHeight - el.clientHeight, rect: el.getBoundingClientRect() }))
+    .filter((i) => i.room > 80 && i.rect.height > 120)
+    .sort((a, b) => b.room - a.room);
+"""
+
+
+def scroll_top(page) -> float:
+    """Read the scrollTop of the board's main scroll container (0 if none found)."""
+    return page.evaluate(
+        "() => {" + _SCROLL_CONTAINER_JS
+        + "  if (cands[0]) return cands[0].el.scrollTop;"
+        + "  return document.scrollingElement ? document.scrollingElement.scrollTop : 0;"
+        + "}"
+    )
+
+
+def set_scroll_top(page, top: float) -> None:
+    """Restore the board scroll position captured by scroll_top()."""
+    page.evaluate(
+        "(top) => {" + _SCROLL_CONTAINER_JS
+        + "  if (cands[0]) { cands[0].el.scrollTop = top; return; }"
+        + "  if (document.scrollingElement) document.scrollingElement.scrollTop = top;"
+        + "}",
+        top,
+    )
+    page.wait_for_timeout(1_500)
+
+
+def return_to_board(page, board_url: str) -> None:
+    """Go back to the Undecided board after downloading a project."""
+    page.goto(board_url, wait_until="commit", timeout=bc.NAV_TIMEOUT_MS)
+    page.wait_for_timeout(2_500)
+    bc.click_text_if_visible(page, "Undecided", timeout=8_000)
+    page.wait_for_timeout(1_500)
+
+
+def download_one(page, q: QualifyingProject, row: BidRow) -> None:
+    """Open one project's row (href or coordinate click) and download its files."""
+    if not open_bid_row(page, row):
         q.status = "failed"
-        q.error = "Row had no direct href to navigate to."
+        q.error = "Could not open row (no href and coordinate click did not open the detail page)."
         return
-
-    log(f"Opening {q.name} -> {q.href}")
-    page.goto(q.href, wait_until="commit", timeout=bc.NAV_TIMEOUT_MS)
-    page.wait_for_timeout(3_000)
 
     if bc.looks_like_login_page(page):
         raise BuildingConnectedLoginRequired(bc.LOGIN_REQUIRED_MESSAGE)
@@ -237,6 +288,79 @@ def download_project(page, q: QualifyingProject) -> None:
     download_selected_files(page)
     q.downloaded_files = selected
     q.status = "downloaded"
+
+
+def run_download_sweep(
+    page, qualifying: list[QualifyingProject], board_url: str
+) -> tuple[int, int]:
+    """
+    Download every qualifying project by sweeping the live board and clicking
+    each row while it is on screen (coordinates are only valid for visible rows).
+    After each download we return to the board and restore the scroll position so
+    the sweep resumes where it left off instead of restarting from the top.
+
+    Returns (downloaded, failed).
+    """
+    targets: dict[str, QualifyingProject] = {}
+    for q in qualifying:
+        targets.setdefault(bc.norm(q.name), q)
+
+    processed: set[str] = set()
+    downloaded = 0
+    failed = 0
+
+    return_to_board(page, board_url)
+    reset_bid_board_scroll(page)
+
+    guard = 0
+    max_iters = MAX_PAGES * MAX_SCROLLS_PER_PAGE
+    while len(processed) < len(targets) and guard < max_iters:
+        guard += 1
+
+        match = None
+        for row in visible_bid_rows(page):
+            key = bc.norm(row_label(row.text))
+            if key in targets and key not in processed:
+                match = (key, row)
+                break
+
+        if match is not None:
+            key, row = match
+            q = targets[key]
+            processed.add(key)
+            resume_top = scroll_top(page)
+            log(f"[{len(processed)}/{len(targets)}] {q.name} (bid {q.bid_date_str})")
+            try:
+                download_one(page, q, row)
+            except BuildingConnectedLoginRequired:
+                raise
+            except Exception as exc:  # keep going on per-project failures
+                q.status = "failed"
+                q.error = str(exc)
+
+            if q.status == "downloaded":
+                downloaded += 1
+                log(f"  downloaded {len(q.downloaded_files)} file(s)")
+            else:
+                failed += 1
+                log(f"  FAILED: {q.error}")
+
+            return_to_board(page, board_url)
+            set_scroll_top(page, resume_top)
+            continue
+
+        # No unprocessed target visible here: scroll, then try the next page.
+        if not scroll_bid_board(page) and not go_to_next_bid_board_page(page):
+            break
+
+    # Anything we never located on the board counts as a failure.
+    for key, q in targets.items():
+        if key not in processed:
+            q.status = "failed"
+            q.error = "Row was not found on the board during the download sweep."
+            failed += 1
+
+    return downloaded, failed
 
 
 def append_to_bid_board_sheet(projects: list[QualifyingProject]) -> list[str]:
@@ -384,9 +508,11 @@ def main(argv: list[str] | None = None) -> int:
         context.set_default_navigation_timeout(bc.NAV_TIMEOUT_MS)
         page = context.pages[0] if context.pages else context.new_page()
 
+        board_url = ""
         try:
             # non_interactive=True so login trouble raises instead of blocking on input().
             ensure_pipeline(page, non_interactive=True)
+            board_url = page.url
             rows = enumerate_board(page)
         except BuildingConnectedLoginRequired as exc:
             print(f"\n{exc}")
@@ -417,27 +543,14 @@ def main(argv: list[str] | None = None) -> int:
             context.close()
             return 0
 
-        downloaded = 0
-        failed = 0
         login_aborted = False
-        for idx, q in enumerate(qualifying, start=1):
-            log(f"[{idx}/{len(qualifying)}] {q.name} (bid {q.bid_date_str})")
-            try:
-                download_project(page, q)
-            except BuildingConnectedLoginRequired as exc:
-                print(f"\n{exc}")
-                login_aborted = True
-                break
-            except Exception as exc:  # keep going on per-project failures
-                q.status = "failed"
-                q.error = str(exc)
-
-            if q.status == "downloaded":
-                downloaded += 1
-                log(f"  downloaded {len(q.downloaded_files)} file(s)")
-            else:
-                failed += 1
-                log(f"  FAILED: {q.error}")
+        try:
+            downloaded, failed = run_download_sweep(page, qualifying, board_url)
+        except BuildingConnectedLoginRequired as exc:
+            print(f"\n{exc}")
+            login_aborted = True
+            downloaded = sum(1 for q in qualifying if q.status == "downloaded")
+            failed = sum(1 for q in qualifying if q.status == "failed")
 
         # Append everything we attempted (successes and failures alike) so
         # run_import can pick them up; already-present rows are skipped.
