@@ -60,10 +60,10 @@ def get_sheet_range(sheets_service):
 
 def get_unread_bid_emails(gmail_service):
     """Fetches unread emails from the specific sender from the last 24 hours."""
-    query = "from:info@comptonsales.com is:unread newer_than:1d"
+    query = "from:beastman7272@gmail.com is:unread newer_than:1d"
     results = gmail_service.users().messages().list(userId='me', q=query).execute()
     return results.get('messages', [])
-
+#info@comptonsales.com
 def decode_gmail_body(data):
     """Decodes a Gmail API body payload."""
     return base64.urlsafe_b64decode(data).decode('utf-8', errors='replace')

@@ -31,9 +31,12 @@ LOGIN_REQUIRED_MESSAGE = (
 )
 EXPORT_CLEANUP_ATTEMPTS = 3
 EXPORT_CLEANUP_WAIT_MS = 5000
-MENU_CLICK_TIMEOUT_MS = 60000
-DOWNLOAD_TIMEOUT_MS = 120000
-EXPORT_WAIT_TIMEOUT_MS = 90000
+EXPORT_CLEANUP_CLEAR_TIMEOUT_MS = 90000
+EXPORT_CLEANUP_CHANGE_TIMEOUT_MS = 15000
+EXPORT_CLEANUP_POLL_MS = 3000
+MENU_CLICK_TIMEOUT_MS = 90000
+DOWNLOAD_TIMEOUT_MS = 180000
+EXPORT_WAIT_TIMEOUT_MS = 180000
 
 MANUFACTURER_DAYS = {
     "Citadel": {"monday"},
@@ -541,31 +544,172 @@ def click_any_visible_delete_all(doc_page: Page) -> bool:
     return False
 
 
-def click_any_confirm(doc_page: Page) -> bool:
-    selectors = [
-        "button:has-text('OK'):visible",
-        "button:has-text('Yes'):visible",
-        "button:has-text('Delete'):visible",
-        "button:has-text('Confirm'):visible",
-        "a:has-text('OK'):visible",
-        "a:has-text('Yes'):visible",
-        "a:has-text('Delete'):visible",
-        "a:has-text('Confirm'):visible",
-        "span:has-text('OK'):visible",
-        "span:has-text('Yes'):visible",
-        "span:has-text('Delete'):visible",
-        "span:has-text('Confirm'):visible",
+def looks_like_delete_all_control(locator: Locator) -> bool:
+    try:
+        text = " ".join((locator.inner_text(timeout=800) or "").split()).lower()
+    except Exception:
+        text = ""
+
+    try:
+        elem_id = (locator.get_attribute("id") or "").strip().lower()
+    except Exception:
+        elem_id = ""
+
+    return elem_id == "deleteallbutton" or "delete all" in text
+
+
+def click_confirm_in_scope(scope: Locator | Page) -> bool:
+    """Click an OK/Yes/Confirm control, never the Delete All button."""
+    labels = ("OK", "Yes", "Confirm", "Delete")
+
+    for label in labels:
+        for role in ("button", "link"):
+            try:
+                candidates = scope.get_by_role(role, name=label, exact=True)
+                count = candidates.count()
+            except Exception:
+                continue
+
+            for i in range(count):
+                candidate = candidates.nth(i)
+                try:
+                    if not candidate.is_visible():
+                        continue
+                    if looks_like_delete_all_control(candidate):
+                        continue
+                    candidate.click(force=True)
+                    return True
+                except Exception:
+                    continue
+
+    # Fallback text locators, still excluding Delete All.
+    fallback_selectors = [
+        "button:text-is('OK'):visible",
+        "button:text-is('Yes'):visible",
+        "button:text-is('Confirm'):visible",
+        "button:text-is('Delete'):visible",
+        "a:text-is('OK'):visible",
+        "a:text-is('Yes'):visible",
+        "a:text-is('Confirm'):visible",
+        "a:text-is('Delete'):visible",
+        "span:text-is('OK'):visible",
+        "span:text-is('Yes'):visible",
+        "span:text-is('Confirm'):visible",
+        "span:text-is('Delete'):visible",
     ]
 
-    for selector in selectors:
+    for selector in fallback_selectors:
         try:
-            locator = doc_page.locator(selector).first
-            if locator.count() and locator.is_visible():
-                locator.click(force=True)
-                return True
+            locator = scope.locator(selector).first
+            if not locator.count() or not locator.is_visible():
+                continue
+            if looks_like_delete_all_control(locator):
+                continue
+            locator.click(force=True)
+            return True
         except Exception:
             continue
+
     return False
+
+
+def click_any_confirm(doc_page: Page) -> bool:
+    dialog_selectors = [
+        ".ui-dialog:visible",
+        "[role='dialog']:visible",
+        ".modal:visible",
+        ".ui-dialog-buttonpane:visible",
+    ]
+
+    for selector in dialog_selectors:
+        try:
+            dialog = doc_page.locator(selector).first
+            if dialog.count() and dialog.is_visible():
+                if click_confirm_in_scope(dialog):
+                    return True
+        except Exception:
+            continue
+
+    return click_confirm_in_scope(doc_page)
+
+
+def wait_for_export_list_change(
+    doc_page: Page,
+    before_names: list[str],
+    timeout_ms: int = EXPORT_CLEANUP_CHANGE_TIMEOUT_MS,
+) -> bool:
+    """Return True once the visible export list differs from before_names."""
+    deadline = time.monotonic() + (timeout_ms / 1000)
+
+    while time.monotonic() < deadline:
+        current = get_visible_export_names(doc_page)
+        if current != before_names:
+            log(f"Export list changed after delete: {current}")
+            return True
+        doc_page.wait_for_timeout(EXPORT_CLEANUP_POLL_MS)
+
+    log("Export list did not change after delete confirmation")
+    return False
+
+
+def wait_for_exports_cleared(
+    doc_page: Page,
+    timeout_ms: int = EXPORT_CLEANUP_CLEAR_TIMEOUT_MS,
+) -> list[str]:
+    """Poll until visible export rows disappear. Returns any remaining names."""
+    deadline = time.monotonic() + (timeout_ms / 1000)
+    remaining = get_visible_export_names(doc_page)
+
+    while remaining and time.monotonic() < deadline:
+        log(f"Waiting for export rows to clear: {remaining}")
+        doc_page.wait_for_timeout(EXPORT_CLEANUP_POLL_MS)
+        remaining = get_visible_export_names(doc_page)
+
+    if not remaining:
+        log("Export rows cleared")
+    return remaining
+
+
+def confirm_and_wait_for_delete(doc_page: Page, before_names: list[str]) -> list[str]:
+    """
+    Confirm Delete All (native dialog or DOM), require the list to change,
+    then wait for rows to clear. Returns remaining names.
+    """
+    dialog_state = {"accepted": False}
+
+    def on_dialog(dialog) -> None:
+        dialog_state["accepted"] = True
+        try:
+            log(f"Accepted native confirm dialog: {dialog.message}")
+            dialog.accept()
+        except Exception as exc:
+            log(f"Failed to accept native confirm dialog: {exc}")
+
+    doc_page.on("dialog", on_dialog)
+    try:
+        if not click_any_visible_delete_all(doc_page):
+            log("Could not find Delete All control")
+            return before_names
+
+        log("Clicked Delete All")
+        doc_page.wait_for_timeout(2000)
+
+        if dialog_state["accepted"]:
+            log("Confirmed Delete All via native dialog")
+        elif click_any_confirm(doc_page):
+            log("Confirmed Delete All")
+        else:
+            log("No confirmation control appeared during cleanup")
+
+        if not wait_for_export_list_change(doc_page, before_names):
+            return get_visible_export_names(doc_page)
+
+        return wait_for_exports_cleared(doc_page)
+    finally:
+        try:
+            doc_page.remove_listener("dialog", on_dialog)
+        except Exception:
+            pass
 
 
 def purge_existing_exports(doc_page: Page) -> None:
@@ -577,20 +721,12 @@ def purge_existing_exports(doc_page: Page) -> None:
             return
 
         log(f"Cleanup attempt {attempt}: found leftover visible export rows: {names}")
+        remaining = confirm_and_wait_for_delete(doc_page, names)
+        if not remaining:
+            return
 
-        if click_any_visible_delete_all(doc_page):
-            log("Clicked Delete All at start of project")
-            doc_page.wait_for_timeout(2000)
-
-            if click_any_confirm(doc_page):
-                log("Confirmed Delete All at start of project")
-            else:
-                log("No confirmation control appeared for start-of-project cleanup")
-
-            doc_page.wait_for_timeout(EXPORT_CLEANUP_WAIT_MS)
-        else:
-            log("Could not find Delete All control at start of project")
-            doc_page.wait_for_timeout(EXPORT_CLEANUP_WAIT_MS)
+        log(f"Start-of-project cleanup attempt {attempt} left rows: {remaining}")
+        doc_page.wait_for_timeout(EXPORT_CLEANUP_WAIT_MS)
 
     remaining = get_visible_export_names(doc_page)
     if remaining:
@@ -724,33 +860,28 @@ def download_new_exported_files(doc_page: Page, project: Project, before_names: 
     return downloaded
 
 
-def delete_all_exports(doc_page: Page) -> None:
+def delete_all_exports(doc_page: Page) -> bool:
+    """Delete Document Center export rows. Returns False if rows remain after attempts."""
     for attempt in range(1, EXPORT_CLEANUP_ATTEMPTS + 1):
         before = get_visible_export_names(doc_page)
 
         if not before:
             log("No visible export rows present at cleanup")
-            return
+            return True
 
         log(f"Cleanup attempt {attempt} with visible export rows: {before}")
+        remaining = confirm_and_wait_for_delete(doc_page, before)
+        if not remaining:
+            return True
 
-        if click_any_visible_delete_all(doc_page):
-            log("Clicked Delete All")
-            doc_page.wait_for_timeout(2000)
-
-            if click_any_confirm(doc_page):
-                log("Confirmed Delete All")
-            else:
-                log("No confirmation control appeared during cleanup")
-
-            doc_page.wait_for_timeout(EXPORT_CLEANUP_WAIT_MS)
-        else:
-            log("Delete All control not found during cleanup")
-            doc_page.wait_for_timeout(EXPORT_CLEANUP_WAIT_MS)
+        log(f"Cleanup attempt {attempt} left rows: {remaining}")
+        doc_page.wait_for_timeout(EXPORT_CLEANUP_WAIT_MS)
 
     after = get_visible_export_names(doc_page)
     if after:
-        raise RuntimeError(f"Could not clear export rows after download: {after}")
+        log(f"Could not clear export rows after download: {after}")
+        return False
+    return True
 
 
 def process_project(page: Page, project: Project) -> None:
@@ -770,7 +901,16 @@ def process_project(page: Page, project: Project) -> None:
         docs = download_new_exported_files(doc_page, project, before_names)
         project.documents_exported = docs or ["No qualifying documents found"]
 
-        delete_all_exports(doc_page)
+        if not delete_all_exports(doc_page):
+            log(
+                "Download succeeded but Document Center cleanup did not finish; "
+                "marking project complete without retry"
+            )
+            print(
+                "  WARNING: Document Center export rows may remain; "
+                "download was saved successfully."
+            )
+
         project.status = "Complete"
     finally:
         log("Closing Document Center tab")

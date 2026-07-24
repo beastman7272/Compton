@@ -50,11 +50,11 @@ PROJECT SEARCH RULES:
 PROCESS THESE 2 PROJECT(S) IN ORDER:
 ============================================================
 
-PROJECT 1/2: Cempa Community Care Renovation- Chattanooga, TN
+PROJECT 1/2: Seven7Brew - Raleigh, NC
 ----------------------------------------
 Action: Find project → note details → download files
 Steps:
-  1. Find "Cempa Community Care Renovation- Chattanooga, TN" in the Undecided tab
+  1. Find "Seven7Brew - Raleigh, NC" in the Undecided tab
   2. Note the Location, Project Size, and Due Date
   3. Go to the Files tab
   4. Open all folders EXCEPT those matching the folder skip list above
@@ -63,11 +63,11 @@ Steps:
   6. Click Download Selected, wait 60 seconds
 
 
-PROJECT 2/2: Hochberg Harmony Veterinary Clinic
+PROJECT 2/2: 102 Maple Townhomes
 ----------------------------------------
 Action: Find project → note details → download files
 Steps:
-  1. Find "Hochberg Harmony Veterinary Clinic" in the Undecided tab
+  1. Find "102 Maple Townhomes" in the Undecided tab
   2. Note the Location, Project Size, and Due Date
   3. Go to the Files tab
   4. Open all folders EXCEPT those matching the folder skip list above

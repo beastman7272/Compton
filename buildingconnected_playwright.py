@@ -680,9 +680,17 @@ def click_project_text_fallback(page: Page, project: str) -> bool:
 
 def scroll_bid_board(page: Page) -> bool:
     before_text = page.locator("body").inner_text(timeout=5_000)[:4_000]
+    # Advance most of a viewport but keep ~1-2 rows of overlap so lazy-loaded
+    # projects are not skipped between scans.
     changed = page.evaluate(
         """
         () => {
+          const overlapPx = 140;
+          const stepFor = (clientHeight) => {
+            const h = clientHeight || 600;
+            return Math.max(240, Math.min(900, h - overlapPx));
+          };
+
           const candidates = [...document.querySelectorAll('div, main, section, [role=grid], [role=table]')]
             .map((el) => ({
               el,
@@ -696,13 +704,15 @@ def scroll_bid_board(page: Page) -> bool:
 
           const target = candidates[0];
           if (target) {
-            target.el.scrollTop = Math.min(target.top + 240, target.el.scrollHeight);
+            const step = stepFor(target.el.clientHeight);
+            target.el.scrollTop = Math.min(target.top + step, target.el.scrollHeight);
             return target.el.scrollTop !== target.top;
           }
 
           const doc = document.scrollingElement;
           const before = doc.scrollTop;
-          doc.scrollTop = Math.min(before + 240, doc.scrollHeight);
+          const step = stepFor(doc.clientHeight || window.innerHeight);
+          doc.scrollTop = Math.min(before + step, doc.scrollHeight);
           return doc.scrollTop !== before;
         }
         """
@@ -710,7 +720,7 @@ def scroll_bid_board(page: Page) -> bool:
     page.wait_for_timeout(2_200)
 
     if not changed:
-        page.mouse.wheel(0, 360)
+        page.mouse.wheel(0, 720)
         page.wait_for_timeout(2_200)
 
     after_wheel = page.locator("body").inner_text(timeout=5_000)[:4_000]
@@ -723,17 +733,94 @@ def scroll_bid_board(page: Page) -> bool:
     return after_key != before_text
 
 
+def detail_page_matches_project(page: Page, project: str) -> bool:
+    """True when the open opportunity page is the intended project (full name available)."""
+    if not is_project_detail_url(page.url):
+        return False
+
+    try:
+        title = page.title()
+    except Exception:
+        title = ""
+    if title and likely_match(project, title):
+        return True
+
+    try:
+        body = page.locator("body").inner_text(timeout=5_000)
+    except Exception:
+        body = ""
+
+    for line in (ln.strip() for ln in body.splitlines() if ln.strip()):
+        if len(line) > 260:
+            continue
+        if likely_match(project, line):
+            return True
+
+    if body and likely_match(project, body[:2_000]):
+        return True
+
+    candidates = [c for c in dom_candidates(page, project) if not bad_candidate_text(c.combined)]
+    return bool(candidates and likely_match(project, candidates[0].combined))
+
+
+def accept_opened_project(
+    page: Page,
+    project: str,
+    *,
+    matched_text: str = "",
+    tag: str = "",
+    href: str = "",
+) -> Candidate | None:
+    if not is_project_detail_url(page.url):
+        return None
+    if not detail_page_matches_project(page, project):
+        log(
+            "Detail page does not match target project "
+            f"(opened text: {(matched_text or page.url)[:120]})"
+        )
+        return None
+    log("Confirmed opened detail page matches target project")
+    return Candidate(matched_text or project, "", "", tag or "DETAIL", 2.0, href or page.url)
+
+
+def return_to_undecided_board(page: Page, *, non_interactive: bool = True) -> None:
+    """Leave a wrong/partial opportunity page and get back to the Undecided list."""
+    log("Returning to Undecided bid board after mismatched open")
+    with contextlib.suppress(Exception):
+        page.go_back(wait_until="commit", timeout=NAV_TIMEOUT_MS)
+        page.wait_for_timeout(2_000)
+
+    if is_project_detail_url(page.url) or "pipeline" not in (page.url or "").lower():
+        ensure_pipeline(page, non_interactive=non_interactive)
+        sort_by_name(page)
+        return
+
+    if not click_undecided_tab(page, non_interactive=non_interactive):
+        ensure_pipeline(page, non_interactive=non_interactive)
+        sort_by_name(page)
+
+
 def open_exact_project_text(page: Page, project: str) -> Candidate | None:
+    # Only consider row-sized nodes. Fat ancestors can contain the target name
+    # somewhere below the fold while their first opportunity link is a different project.
     boxes = page.evaluate(
         """
         (project) => {
           const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
           const target = clean(project).toLowerCase();
+          if (!target) return [];
           const out = [];
+          const nodes = [...document.querySelectorAll(
+            '[role=row], tr, a[href*="/opportunities/"], [class*=Row], [class*=row]'
+          )];
 
-          for (const el of document.querySelectorAll('a,button,[role=row],tr,div,span')) {
+          for (const el of nodes) {
             const text = clean(el.innerText || el.textContent || '');
+            if (text.length < 10 || text.length > 500) continue;
             if (!text.toLowerCase().includes(target)) continue;
+
+            const lower = text.toLowerCase();
+            if (lower.includes('filtered by') || lower.includes('assign name bid date')) continue;
 
             const rect = el.getBoundingClientRect();
             const visible =
@@ -745,7 +832,13 @@ def open_exact_project_text(page: Page, project: str) -> Candidate | None:
               rect.left <= window.innerWidth;
             if (!visible) continue;
 
-            const link = el.closest('a[href*="/opportunities/"]') || el.querySelector?.('a[href*="/opportunities/"]');
+            let link = null;
+            if (el.matches?.('a[href*="/opportunities/"]')) {
+              link = el;
+            } else {
+              link = el.querySelector?.('a[href*="/opportunities/"]') || null;
+            }
+
             out.push({
               tag: el.tagName,
               text,
@@ -762,18 +855,38 @@ def open_exact_project_text(page: Page, project: str) -> Candidate | None:
     )
 
     for box in boxes:
+        label = row_label(box["text"])
+        if norm(project) not in norm(box["text"]) and not likely_match(project, label):
+            continue
+
         log(f"Found exact project text in visible DOM: {box['text'][:120]}")
+        opened = False
         if box["href"]:
             page.goto(box["href"], wait_until="commit", timeout=NAV_TIMEOUT_MS)
             page.wait_for_timeout(2_500)
-            if is_project_detail_url(page.url):
-                return Candidate(project, "", "", box["tag"], 2.0, box["href"])
+            opened = is_project_detail_url(page.url)
 
-        for click_count in (1, 2):
-            page.mouse.click(box["x"], box["y"], click_count=click_count)
-            page.wait_for_timeout(2_500)
-            if is_project_detail_url(page.url):
-                return Candidate(project, "", "", box["tag"], 2.0)
+        if not opened:
+            for click_count in (1, 2):
+                page.mouse.click(box["x"], box["y"], click_count=click_count)
+                page.wait_for_timeout(2_500)
+                if is_project_detail_url(page.url):
+                    opened = True
+                    break
+
+        if not opened:
+            continue
+
+        accepted = accept_opened_project(
+            page,
+            project,
+            matched_text=box["text"],
+            tag=box["tag"],
+            href=box["href"] or page.url,
+        )
+        if accepted:
+            return accepted
+        return_to_undecided_board(page)
 
     try:
         locator = page.get_by_text(project, exact=False).first
@@ -782,14 +895,22 @@ def open_exact_project_text(page: Page, project: str) -> Candidate | None:
         page.wait_for_timeout(800)
         log("Found exact project text outside visible-row scan")
 
+        opened = False
         for click_count in (1, 2):
             locator.click(timeout=4_000, click_count=click_count)
             page.wait_for_timeout(2_500)
             if is_project_detail_url(page.url):
-                return Candidate(project, "", "", "TEXT", 2.0)
+                opened = True
+                break
 
-        if click_project_text_fallback(page, project):
-            return Candidate(project, "", "", "TEXT", 2.0)
+        if not opened and click_project_text_fallback(page, project):
+            opened = is_project_detail_url(page.url)
+
+        if opened:
+            accepted = accept_opened_project(page, project, matched_text=project, tag="TEXT")
+            if accepted:
+                return accepted
+            return_to_undecided_board(page)
     except Exception:
         return None
 
@@ -1004,14 +1125,30 @@ def find_and_open_project(page: Page, project: str) -> Candidate | None:
         rows = visible_bid_rows(page)
         print_visible_bid_rows(scan, rows)
 
+        mismatched_open = False
         for row in rows:
             if not row_matches_project(project, row):
                 continue
 
             log(f"Matched visible row: {row_label(row.text)}")
             if open_bid_row(page, row) or click_project_text_fallback(page, project):
-                return Candidate(row.text, "", "", row.tag, 2.0, row.href)
+                accepted = accept_opened_project(
+                    page,
+                    project,
+                    matched_text=row.text,
+                    tag=row.tag,
+                    href=row.href,
+                )
+                if accepted:
+                    return accepted
+                return_to_undecided_board(page)
+                mismatched_open = True
+                log("Matching row opened wrong project; continuing scan")
+                break
             log("Matching row found, but project detail page did not open")
+
+        if mismatched_open:
+            continue
 
         if scroll_bid_board(page):
             log("Scrolled bid board")
@@ -1160,8 +1297,16 @@ def extract_file_name(raw: str) -> str:
     return (match.group(1) if match else text).strip()
 
 
+SELECTABLE_FILE_EXT_RE = re.compile(r"\.(pdf|zip|docx?|xlsx?|dwg|rvt|txt)\b", re.I)
+ANY_FILE_EXT_RE = re.compile(r"\.[a-z0-9]{2,5}\b", re.I)
+
+
 def is_probable_file(name: str) -> bool:
-    return bool(re.search(r"\.(pdf|zip|docx?|xlsx?|dwg|rvt|txt)\b", name, re.I))
+    return bool(SELECTABLE_FILE_EXT_RE.search(name or ""))
+
+
+def has_file_extension(name: str) -> bool:
+    return bool(ANY_FILE_EXT_RE.search(name or ""))
 
 
 def item_looks_like_folder(item: dict[str, str]) -> bool:
@@ -1219,13 +1364,23 @@ def classified_file_items(page: Page) -> list[tuple[str, str, str, str]]:
             continue
         seen.add(name.lower())
 
-        kind = "file" if is_probable_file(name) else "folder"
-        if kind == "folder":
+        # Never treat extension-bearing rows (e.g. .mpp) as folders.
+        if is_probable_file(name):
+            kind = "file"
+            skip, reason = should_skip_file(name)
+            action = "SKIP" if skip else "SELECT"
+        elif has_file_extension(name):
+            kind = "file"
+            action = "SKIP"
+            reason = "non-selectable file type"
+        elif item_looks_like_folder(item) or not has_file_extension(name):
+            kind = "folder"
             skip, reason = should_skip_folder(name)
             action = "SKIP" if skip else "OPEN"
         else:
-            skip, reason = should_skip_file(name)
-            action = "SKIP" if skip else "SELECT"
+            kind = "file"
+            action = "SKIP"
+            reason = "unclassified file item"
 
         classified.append((kind, action, name, reason))
 
@@ -1252,26 +1407,38 @@ def print_classification_rows(rows: list[tuple[str, str, str, str]]) -> None:
         print(f"  {action:6} {kind:6} {name} ({reason})")
 
 
-def select_file_by_name(page: Page, file_name: str) -> bool:
-    return bool(
-        page.evaluate(
+def select_file_by_name(page: Page, file_name: str) -> tuple[bool, str]:
+    """Try to check the Files-tab checkbox for file_name. Returns (ok, reason)."""
+    for attempt in range(1, 4):
+        result = page.evaluate(
             """
             async (fileName) => {
               const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
               const target = clean(fileName).toLowerCase();
               const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
               const checked = (el) =>
-                Boolean(el.checked) ||
-                el.getAttribute('aria-checked') === 'true' ||
-                el.className?.toString().toLowerCase().includes('checked');
+                Boolean(el?.checked) ||
+                el?.getAttribute?.('aria-checked') === 'true' ||
+                (el?.className?.toString() || '').toLowerCase().includes('checked');
 
-              const nodes = [...document.querySelectorAll('div, span, a, [role=row], tr, [class*=row], [class*=Row]')]
+              const rowChecked = (row) => {
+                const boxes = [...row.querySelectorAll(
+                  'input[type=checkbox], [role=checkbox], [aria-checked]'
+                )];
+                return boxes.some(checked);
+              };
+
+              const nodes = [...document.querySelectorAll(
+                '[role=row], tr, [class*=row], [class*=Row], div, span, a'
+              )]
                 .map((el) => ({ el, text: clean(el.innerText || el.textContent || '') }))
                 .filter(({ text }) => {
                   const lower = text.toLowerCase();
                   return lower === target || lower.startsWith(`${target} `);
                 })
                 .sort((a, b) => a.text.length - b.text.length);
+
+              if (!nodes.length) return { ok: false, reason: 'row not found' };
 
               for (const { el } of nodes) {
                 const containers = [];
@@ -1281,23 +1448,40 @@ def select_file_by_name(page: Page, file_name: str) -> bool:
                 }
 
                 const row = containers.find((candidate) =>
-                  candidate.matches?.('[role=row], tr, [class*=row], [class*=Row]')
+                  candidate.matches?.('[role=row], tr')
+                ) || containers.find((candidate) =>
+                  candidate.matches?.('[class*=row], [class*=Row]')
                 ) || containers.find((candidate) => {
                   const rect = candidate.getBoundingClientRect();
-                  return rect.width > 250 && rect.height > 18;
-                }) || el.parentElement || el;
+                  return rect.width > 250 && rect.height > 18 && rect.height < 120;
+                }) || el;
+
+                try {
+                  row.scrollIntoView({ block: 'center', inline: 'nearest' });
+                } catch (e) {}
+                await sleep(200);
 
                 const checkbox = row.querySelector(
                   'input[type=checkbox], [role=checkbox], [aria-checked]'
                 );
-
-                if (checkbox) {
+                if (!checkbox) {
+                  // Fall through to coordinate click near the left edge.
+                } else {
                   checkbox.scrollIntoView({ block: 'center' });
                   if (!checked(checkbox)) {
                     checkbox.click();
-                    await sleep(150);
+                    await sleep(400);
                   }
-                  if (checked(checkbox)) return true;
+                  if (checked(checkbox) || rowChecked(row)) {
+                    return { ok: true, reason: 'checkbox checked' };
+                  }
+                  // Some BC controls toggle on a parent button/div, not the input itself.
+                  const clickable = checkbox.closest('button, [role=checkbox], label') || checkbox;
+                  clickable.click();
+                  await sleep(400);
+                  if (checked(checkbox) || rowChecked(row)) {
+                    return { ok: true, reason: 'checkbox checked via wrapper' };
+                  }
                 }
 
                 const rect = row.getBoundingClientRect();
@@ -1307,21 +1491,29 @@ def select_file_by_name(page: Page, file_name: str) -> bool:
                   const targetAtPoint = document.elementFromPoint(x, y);
                   if (targetAtPoint) {
                     targetAtPoint.click();
-                    await sleep(150);
-                    const nowChecked = row.querySelector(
-                      'input[type=checkbox]:checked, [role=checkbox][aria-checked=true], [aria-checked=true]'
-                    );
-                    if (nowChecked) return true;
+                    await sleep(400);
+                    if (rowChecked(row)) {
+                      return { ok: true, reason: 'checked via coordinate click' };
+                    }
                   }
                 }
               }
 
-              return false;
+              return { ok: false, reason: 'checkbox not checked' };
             }
             """,
             file_name,
         )
-    )
+        if result and result.get("ok"):
+            return True, str(result.get("reason") or "selected")
+
+        reason = str((result or {}).get("reason") or "unknown")
+        if attempt < 3:
+            page.wait_for_timeout(500)
+            continue
+        return False, reason
+
+    return False, "unknown"
 
 
 def select_classified_files(page: Page, rows: list[tuple[str, str, str, str]], label: str) -> list[str]:
@@ -1340,11 +1532,12 @@ def select_classified_files(page: Page, rows: list[tuple[str, str, str, str]], l
             continue
         seen.add(key)
 
-        if select_file_by_name(page, file_name):
+        ok, reason = select_file_by_name(page, file_name)
+        if ok:
             selected.append(file_name)
             print(f"  SELECTED {file_name}")
         else:
-            print(f"  FAILED   {file_name}")
+            print(f"  FAILED   {file_name} ({reason})")
 
     page.wait_for_timeout(1_000)
     return selected
@@ -1458,6 +1651,12 @@ def select_allowed_files(page: Page) -> list[str]:
         ]
         selected.extend(select_classified_files(page, child_rows, folder_name))
         return_to_files_root(page, root_url)
+
+    # Re-open a clean Files root before selecting root files. Folder navigation
+    # (and mis-opened non-folder items) can leave checkboxes in a bad state.
+    if folders:
+        reset_files_view(page)
+        root_rows = classified_file_items(page)
 
     # Select root files last. Reloading/navigating after selecting them clears
     # BC's checkbox state and hides the Download Selected control even though
