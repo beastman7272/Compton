@@ -60,7 +60,7 @@ def get_sheet_range(sheets_service):
 
 def get_unread_bid_emails(gmail_service):
     """Fetches unread emails from the specific sender from the last 24 hours."""
-    query = "from:info@comptonsales.com is:unread newer_than:1d"
+    query = "from:team@buildingconnected.com is:unread newer_than:1d"  #info@comptonsales.com
     results = gmail_service.users().messages().list(userId='me', q=query).execute()
     return results.get('messages', [])
 
