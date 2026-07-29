@@ -14,7 +14,7 @@ from pathlib import Path
 
 from app import config
 from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import ElementHandle, Locator, Page, sync_playwright
+from playwright.sync_api import Locator, Page, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 START_URL = "https://app.buildingconnected.com/opportunities/pipeline"
@@ -1235,6 +1235,7 @@ def visible_file_items(page: Page) -> list[dict[str, str]]:
           const out = [];
 
           for (const el of nodes) {
+            if (el.closest('[data-id="file-list-tools"]')) continue;
             const text = clean(el.innerText || el.textContent || '');
             const title = clean(el.getAttribute('title'));
             const aria = clean(el.getAttribute('aria-label'));
@@ -1352,9 +1353,17 @@ def classified_file_items(page: Page) -> list[tuple[str, str, str, str]]:
     for item in items:
         raw = item["text"] or item["title"] or item["aria"]
         name = extract_file_name(raw)
-        if not name or name.lower() in {"download all", "plan room pro"}:
+        if not name or name.lower() in {
+            "download all",
+            "download selected",
+            "plan room pro",
+        }:
             continue
-        if "download all" in name.lower() or "copy all to internal files" in name.lower():
+        if (
+            "download all" in name.lower()
+            or "download selected" in name.lower()
+            or "copy all to internal files" in name.lower()
+        ):
             continue
         if " name indicator size date modified " in f" {name.lower()} ":
             continue
@@ -1416,10 +1425,14 @@ def select_file_by_name(page: Page, file_name: str) -> tuple[bool, str]:
               const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
               const target = clean(fileName).toLowerCase();
               const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-              const checked = (el) =>
-                Boolean(el?.checked) ||
-                el?.getAttribute?.('aria-checked') === 'true' ||
-                (el?.className?.toString() || '').toLowerCase().includes('checked');
+              const checked = (el) => {
+                const className = (el?.className?.toString() || '').toLowerCase();
+                return (
+                  Boolean(el?.checked) ||
+                  el?.getAttribute?.('aria-checked') === 'true' ||
+                  (className.includes('checked') && !className.includes('unchecked'))
+                );
+              };
 
               const rowChecked = (row) => {
                 const boxes = [...row.querySelectorAll(
@@ -1569,6 +1582,11 @@ def open_folder_by_name(page: Page, folder_name: str) -> bool:
 
 
 def return_to_files_root(page: Page, root_url: str) -> None:
+    # BuildingConnected expands folders inline without changing the URL.
+    # Going back in that state leaves the project and clears its selections.
+    if page.url == root_url:
+        return
+
     try:
         page.go_back(wait_until="commit", timeout=10_000)
         page.wait_for_timeout(2_000)
@@ -1638,6 +1656,10 @@ def select_allowed_files(page: Page) -> list[str]:
         if kind == "folder" and action == "OPEN"
     ]
 
+    # Select root files before expanding folders so no reload or navigation is
+    # required after the first selection.
+    selected.extend(select_classified_files(page, root_rows, "root files"))
+
     root_url = page.url
     for folder_name in folders:
         if not open_folder_by_name(page, folder_name):
@@ -1651,17 +1673,6 @@ def select_allowed_files(page: Page) -> list[str]:
         ]
         selected.extend(select_classified_files(page, child_rows, folder_name))
         return_to_files_root(page, root_url)
-
-    # Re-open a clean Files root before selecting root files. Folder navigation
-    # (and mis-opened non-folder items) can leave checkboxes in a bad state.
-    if folders:
-        reset_files_view(page)
-        root_rows = classified_file_items(page)
-
-    # Select root files last. Reloading/navigating after selecting them clears
-    # BC's checkbox state and hides the Download Selected control even though
-    # the Python summary still contains the filenames.
-    selected.extend(select_classified_files(page, root_rows, "root files"))
 
     print("\nSelected Files Summary:")
     if selected:
@@ -1694,131 +1705,140 @@ def unique_download_path(filename: str) -> Path:
     raise RuntimeError(f"Could not create unique download path for {filename}")
 
 
-def selected_download_button(page: Page) -> Locator | ElementHandle | None:
+def selected_download_button(
+    page: Page,
+    *,
+    selection_expected: bool = False,
+) -> Locator | None:
+    if not selection_expected:
+        return None
+
     candidates = [
-        page.get_by_role("button", name=re.compile(r"download\s+selected", re.I)).first,
-        page.locator("button:has-text('Download Selected')").first,
-        page.locator("a:has-text('Download Selected')").first,
-        page.locator("[role=button]:has-text('Download Selected')").first,
-        page.get_by_text(re.compile(r"download\s+selected", re.I)).first,
+        (
+            'data-testid="download-all-bttn"',
+            page.locator('[data-testid="download-all-bttn"]').first,
+        ),
+        (
+            'role="button" name="Download Selected"',
+            page.get_by_role(
+                "button",
+                name=re.compile(r"^\s*download\s+selected\s*$", re.I),
+            ).first,
+        ),
+        (
+            "button text",
+            page.locator("button:has-text('Download Selected')").first,
+        ),
+        (
+            "input value",
+            page.locator(
+                "input[type=button][value='Download Selected' i], "
+                "input[type=submit][value='Download Selected' i]"
+            ).first,
+        ),
     ]
 
-    for candidate in candidates:
+    for source, candidate in candidates:
         try:
             candidate.wait_for(state="visible", timeout=4_000)
-            return candidate
+            label = candidate.evaluate(
+                """
+                (el) => (
+                  el.innerText ||
+                  el.textContent ||
+                  el.value ||
+                  el.getAttribute('aria-label') ||
+                  ''
+                ).replace(/\\s+/g, ' ').trim()
+                """
+            )
+            if re.fullmatch(r"download\s+selected", str(label), re.I):
+                log(f"Confirmed Download Selected control via {source}")
+                return candidate
         except Exception:
             continue
 
-    handle = page.evaluate_handle(
-        """
-        () => {
-          const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-          const nodes = [...document.querySelectorAll('button, a, [role=button], div, span')];
-          const matches = nodes
-            .map((el) => {
-              const label = clean([
-                el.innerText || el.textContent || '',
-                el.getAttribute('aria-label') || '',
-                el.getAttribute('title') || '',
-              ].join(' '));
-              return { el, label };
-            })
-            .filter(({ el, label }) => {
-              if (!label.includes('download selected') || label.includes('download all')) return false;
-              const rect = el.getBoundingClientRect();
-              const visible = rect.width > 1 && rect.height > 1 && getComputedStyle(el).visibility !== 'hidden';
-              return visible;
-            })
-            .sort((a, b) => a.label.length - b.label.length);
-
-          const match = matches[0];
-          if (!match) return null;
-
-          return match.el.closest('button, a, [role=button]') || match.el;
-        }
-        """
-    )
-    element = handle.as_element()
-    if element:
-        return element
-
-    toolbar_handle = page.evaluate_handle(
-        """
-        () => {
-          const checked = document.querySelectorAll(
-            'input[type=checkbox]:checked, [aria-checked=true]'
-          ).length;
-          if (!checked) return null;
-
-          const toolbar = document.querySelector('[data-id="file-list-tools"]');
-          if (!toolbar) return null;
-
-          const candidates = [...toolbar.querySelectorAll('div, button, a, [role=button]')]
-            .map((el) => ({ el, rect: el.getBoundingClientRect() }))
-            .filter(({ rect }) => rect.width > 20 && rect.height > 20)
-            .sort((a, b) => a.rect.left - b.rect.left || a.rect.top - b.rect.top);
-
-          return candidates[0]?.el || null;
-        }
-        """
-    )
-    return toolbar_handle.as_element()
+    return None
 
 
-def selected_download_diagnostics(page: Page) -> str:
+def selected_download_diagnostics(page: Page, expected_selected: int) -> str:
     details = page.evaluate(
         """
         () => {
           const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-          const controls = [...document.querySelectorAll('button, a, [role=button], [aria-label], [title]')]
-            .map((el) => clean([
-              el.innerText || el.textContent || '',
-              el.getAttribute('aria-label') || '',
-              el.getAttribute('title') || '',
-            ].join(' ')))
-            .filter((label) => /download/i.test(label))
-            .slice(0, 12);
+          const target = document.querySelector('[data-testid="download-all-bttn"]');
+          const targetStyle = target ? getComputedStyle(target) : null;
+          const targetDetails = target ? {
+            label: clean(
+              target.innerText ||
+              target.textContent ||
+              target.value ||
+              target.getAttribute('aria-label') ||
+              ''
+            ),
+            visible:
+              target.getBoundingClientRect().width > 0 &&
+              target.getBoundingClientRect().height > 0 &&
+              targetStyle.visibility !== 'hidden' &&
+              targetStyle.display !== 'none',
+            disabled: Boolean(target.disabled) || target.getAttribute('aria-disabled') === 'true',
+          } : null;
 
-          const checked = [...document.querySelectorAll('input[type=checkbox]:checked, [aria-checked=true]')].length;
-          return { controls, checked };
+          const isChecked = (el) => {
+            const className = (el?.className?.toString() || '').toLowerCase();
+            return (
+              Boolean(el?.checked) ||
+              el?.getAttribute?.('aria-checked') === 'true' ||
+              (className.includes('checked') && !className.includes('unchecked'))
+            );
+          };
+          const checked = [...document.querySelectorAll(
+            'input[type=checkbox], [role=checkbox], [aria-checked]'
+          )].filter(isChecked).length;
+          return { targetDetails, checked };
         }
         """
     )
-    controls = details.get("controls") or []
+    target = details.get("targetDetails")
     checked = details.get("checked", 0)
-    labels = "; ".join(controls) if controls else "none"
-    return f"visible download controls: {labels}; checked controls: {checked}"
+    return (
+        f"target control: {target or 'not found'}; "
+        f"verified file names: {expected_selected}; checked controls: {checked}"
+    )
 
 
-def click_selected_download_button(page: Page, button: Locator | ElementHandle) -> None:
-    try:
-        button.click()
-    except Exception:
-        page.evaluate(
-            """
-            (el) => {
-              el.scrollIntoView({ block: 'center', inline: 'center' });
-              el.click();
-            }
-            """,
-            button,
+def click_selected_download_button(button: Locator) -> None:
+    label = button.evaluate(
+        """
+        (el) => (
+          el.innerText ||
+          el.textContent ||
+          el.value ||
+          el.getAttribute('aria-label') ||
+          ''
+        ).replace(/\\s+/g, ' ').trim()
+        """
+    )
+    if not re.fullmatch(r"download\s+selected", str(label), re.I):
+        raise RuntimeError(
+            f"Download control changed to {label!r}; refusing to click it."
         )
+    button.click(timeout=10_000)
 
 
-def download_selected_files(page: Page) -> Path:
+def download_selected_files(page: Page, selected_count: int) -> Path:
     log("Clicking selected-files download control")
     page.wait_for_timeout(1_000)
-    button = selected_download_button(page)
+    button = selected_download_button(page, selection_expected=selected_count > 0)
     if button is None:
-        diagnostics = selected_download_diagnostics(page)
+        diagnostics = selected_download_diagnostics(page, selected_count)
         raise RuntimeError(
             "No selected-files download button was found; refusing to click Download All. "
             f"Diagnostics: {diagnostics}"
         )
 
     with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as download_info:
-        click_selected_download_button(page, button)
+        click_selected_download_button(button)
 
     download = download_info.value
     target = unique_download_path(download.suggested_filename)
@@ -1916,12 +1936,14 @@ def page_is_unusable(page: Page, result: dict[str, object] | None = None) -> boo
 
 
 def open_fresh_page(context, page: Page | None = None) -> Page:
+    # Persistent Chromium contexts may close when their final page is closed,
+    # so create the replacement before disposing of the failed page.
+    fresh = context.new_page()
+    fresh.set_default_navigation_timeout(NAV_TIMEOUT_MS)
     if page is not None:
         with contextlib.suppress(Exception):
             if not page.is_closed():
                 page.close()
-    fresh = context.new_page()
-    fresh.set_default_navigation_timeout(NAV_TIMEOUT_MS)
     log("Opened fresh browser page after crash/unusable state")
     return fresh
 
@@ -1984,7 +2006,9 @@ def process_project(
             result["files"] = selected
             if download_files:
                 if selected:
-                    result["download_path"] = str(download_selected_files(page))
+                    result["download_path"] = str(
+                        download_selected_files(page, len(selected))
+                    )
                 else:
                     log("Download skipped: no files were selected.")
         else:

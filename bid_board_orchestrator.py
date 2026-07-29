@@ -813,9 +813,11 @@ def phase2_playwright_run(
                         page = open_fresh_page(context, page)
         finally:
             if not cdp_url:
-                context.close()
+                with contextlib.suppress(Exception):
+                    context.close()
             elif browser_instance:
-                browser_instance.close()
+                with contextlib.suppress(Exception):
+                    browser_instance.close()
 
     with open_utf8(PLAYWRIGHT_RESULTS_FILE, "w") as f:
         json.dump(results, f, indent=2)

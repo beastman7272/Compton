@@ -50,11 +50,11 @@ PROJECT SEARCH RULES:
 PROCESS THESE 2 PROJECT(S) IN ORDER:
 ============================================================
 
-PROJECT 1/2: Seven7Brew - Raleigh, NC
+PROJECT 1/2: Raising Cane's - Greenville
 ----------------------------------------
 Action: Find project → note details → download files
 Steps:
-  1. Find "Seven7Brew - Raleigh, NC" in the Undecided tab
+  1. Find "Raising Cane's - Greenville" in the Undecided tab
   2. Note the Location, Project Size, and Due Date
   3. Go to the Files tab
   4. Open all folders EXCEPT those matching the folder skip list above
@@ -63,11 +63,11 @@ Steps:
   6. Click Download Selected, wait 60 seconds
 
 
-PROJECT 2/2: 102 Maple Townhomes
+PROJECT 2/2: US Postal Service-EVSE-Raleigh, NC (Avent Ferry)
 ----------------------------------------
 Action: Find project → note details → download files
 Steps:
-  1. Find "102 Maple Townhomes" in the Undecided tab
+  1. Find "US Postal Service-EVSE-Raleigh, NC (Avent Ferry)" in the Undecided tab
   2. Note the Location, Project Size, and Due Date
   3. Go to the Files tab
   4. Open all folders EXCEPT those matching the folder skip list above
