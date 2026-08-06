@@ -47,27 +47,14 @@ PROJECT SEARCH RULES:
 
   DO NOT STOP TO ASK FOR PERMISSION OR CONFIRMATION! You must operate unattended.
 
-PROCESS THESE 2 PROJECT(S) IN ORDER:
+PROCESS THESE 1 PROJECT(S) IN ORDER:
 ============================================================
 
-PROJECT 1/2: Raising Cane's - Greenville
+PROJECT 1/1: Dodgen Middle School Renovations
 ----------------------------------------
 Action: Find project → note details → download files
 Steps:
-  1. Find "Raising Cane's - Greenville" in the Undecided tab
-  2. Note the Location, Project Size, and Due Date
-  3. Go to the Files tab
-  4. Open all folders EXCEPT those matching the folder skip list above
-     (but DO open folders that also contain Plans/Specifications/Specs)
-  5. Select all files EXCEPT those matching the file skip list above
-  6. Click Download Selected, wait 60 seconds
-
-
-PROJECT 2/2: US Postal Service-EVSE-Raleigh, NC (Avent Ferry)
-----------------------------------------
-Action: Find project → note details → download files
-Steps:
-  1. Find "US Postal Service-EVSE-Raleigh, NC (Avent Ferry)" in the Undecided tab
+  1. Find "Dodgen Middle School Renovations" in the Undecided tab
   2. Note the Location, Project Size, and Due Date
   3. Go to the Files tab
   4. Open all folders EXCEPT those matching the folder skip list above
