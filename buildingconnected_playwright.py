@@ -6,21 +6,38 @@ import contextlib
 import io
 import json
 import re
+import time
+from datetime import datetime
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 
+from app import config
 from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import ElementHandle, Locator, Page, sync_playwright
+from playwright.sync_api import Locator, Page, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 START_URL = "https://app.buildingconnected.com/opportunities/pipeline"
-PROFILE_DIR = Path("playwright_bc_profile")
-DOWNLOAD_DIR = Path.home() / "Downloads"
+PROFILE_DIR = config.BC_PLAYWRIGHT_PROFILE_DIR
+DOWNLOAD_DIR = config.DOWNLOADS_DIR
 DEFAULT_PROJECT = "Lee County General Services Building Expansion"
 LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled", "--start-maximized"]
+HOSTED_LAUNCH_ARGS = [
+    "--disable-dev-shm-usage",
+    "--disable-session-crashed-bubble",
+    "--no-sandbox",
+]
+RECOVERY_UI_TIMEOUT_MS = 2_000
+PIPELINE_READY_POLL_MS = 500
+BODY_TEXT_PROBE_TIMEOUT_MS = 1_500
 NAV_TIMEOUT_MS = 120_000
 DOWNLOAD_TIMEOUT_MS = 180_000
+HOSTED_PIPELINE_READY_TIMEOUT_MS = 45_000
+HOSTED_PIPELINE_STABILITY_MS = 7_000
+LOCAL_PIPELINE_READY_TIMEOUT_MS = 12_000
+HOSTED_UNDECIDED_TAB_TIMEOUT_MS = 15_000
+LOCAL_UNDECIDED_TAB_TIMEOUT_MS = 8_000
+HOSTED_VIEWPORT = {"width": 1440, "height": 1000}
 LOG_ENABLED = True
 LOGIN_REQUIRED_MESSAGE = (
     "BuildingConnected login/MFA required. Open the Playwright browser profile, "
@@ -154,15 +171,236 @@ def click_text_if_visible(page: Page, text: str, timeout: int = 8_000) -> bool:
         return False
 
 
-def open_pipeline(page: Page, *, non_interactive: bool = False) -> None:
+def pipeline_ready_timeout_ms() -> int:
+    return HOSTED_PIPELINE_READY_TIMEOUT_MS if config.HOSTED_RUNTIME else LOCAL_PIPELINE_READY_TIMEOUT_MS
+
+
+def undecided_tab_timeout_ms() -> int:
+    return HOSTED_UNDECIDED_TAB_TIMEOUT_MS if config.HOSTED_RUNTIME else LOCAL_UNDECIDED_TAB_TIMEOUT_MS
+
+
+def playwright_launch_args() -> list[str]:
+    args = list(LAUNCH_ARGS)
+    if config.HOSTED_RUNTIME:
+        args.extend(HOSTED_LAUNCH_ARGS)
+    return args
+
+
+def dismiss_browser_recovery_ui(page: Page) -> bool:
+    """Dismiss Chromium 'Restore pages?' infobar if it blocks the Bid Board UI."""
+    button_patterns = [
+        ("restore", re.compile(r"^Restore$", re.I)),
+        ("restore_pages", re.compile(r"Restore pages", re.I)),
+        ("cancel", re.compile(r"^Cancel$", re.I)),
+        ("close", re.compile(r"^Close$", re.I)),
+        ("not_now", re.compile(r"Not now", re.I)),
+        ("dont_restore", re.compile(r"Don'?t restore", re.I)),
+    ]
+    for label, pattern in button_patterns:
+        try:
+            button = page.get_by_role("button", name=pattern).first
+            button.wait_for(state="visible", timeout=RECOVERY_UI_TIMEOUT_MS)
+            button.click()
+            page.wait_for_timeout(500)
+            log(f"Dismissed crash-restore dialog via {label}")
+            return True
+        except Exception:
+            continue
+
+    for label, pattern in button_patterns:
+        try:
+            button = page.locator("button").filter(has_text=pattern).first
+            button.wait_for(state="visible", timeout=RECOVERY_UI_TIMEOUT_MS)
+            button.click()
+            page.wait_for_timeout(500)
+            log(f"Dismissed crash-restore dialog via button filter ({label})")
+            return True
+        except Exception:
+            continue
+
+    text_patterns = [
+        ("restore_text", re.compile(r"^Restore$", re.I)),
+        ("restore_pages_text", re.compile(r"Restore pages", re.I)),
+        ("cancel_text", re.compile(r"^Cancel$", re.I)),
+        ("close_text", re.compile(r"^Close$", re.I)),
+    ]
+    for label, pattern in text_patterns:
+        try:
+            target = page.get_by_text(pattern).first
+            target.wait_for(state="visible", timeout=RECOVERY_UI_TIMEOUT_MS)
+            target.click()
+            page.wait_for_timeout(500)
+            log(f"Dismissed crash-restore dialog via text locator ({label})")
+            return True
+        except Exception:
+            continue
+
     try:
-        page.goto(START_URL, wait_until="commit", timeout=NAV_TIMEOUT_MS)
+        page.get_by_text(
+            re.compile(r"Restore pages|didn['']t shut down correctly|Chromium didn", re.I)
+        ).first.wait_for(state="visible", timeout=800)
+        with contextlib.suppress(Exception):
+            page.get_by_text(re.compile(r"^Restore$", re.I)).first.click()
+            page.wait_for_timeout(500)
+            log("Dismissed crash-restore dialog via infobar Restore text")
+            return True
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+        log("Dismissed crash-restore dialog via Escape")
+        return True
+    except Exception:
+        pass
+
+    with contextlib.suppress(Exception):
+        page.keyboard.press("Escape")
+    return False
+
+
+def _locator_visible(locator: Locator, *, timeout_ms: int = 500) -> bool:
+    try:
+        locator.wait_for(state="visible", timeout=timeout_ms)
+        return True
+    except Exception:
+        return False
+
+
+def pipeline_is_ready(page: Page) -> tuple[bool, str]:
+    """Return whether the Bid Board pipeline appears loaded and which check matched."""
+    undecided_tab = page.get_by_role("tab", name=re.compile(r"Undecided", re.I)).first
+    if _locator_visible(undecided_tab):
+        return True, "undecided_tab"
+
+    bid_board_text = page.get_by_text("Bid Board", exact=False).first
+    if _locator_visible(bid_board_text):
+        return True, "bid_board_text"
+
+    try:
+        url = (page.url or "").lower()
+        title = page.title().lower()
+        if "opportunities/pipeline" in url and "bid board" in title:
+            return True, "url_title"
+    except Exception:
+        pass
+
+    undecided_text = page.get_by_text(re.compile(r"Undecided", re.I)).first
+    if _locator_visible(undecided_text):
+        return True, "undecided_text"
+
+    try:
+        body_text = page.locator("body").inner_text(timeout=BODY_TEXT_PROBE_TIMEOUT_MS)
+        if re.search(r"Undecided", body_text, re.I):
+            return True, "body_undecided"
+    except Exception:
+        pass
+
+    return False, ""
+
+
+def is_on_undecided_view(page: Page) -> bool:
+    try:
+        selected_tab = page.locator("[role='tab'][aria-selected='true']").filter(
+            has_text=re.compile(r"Undecided", re.I)
+        ).first
+        if _locator_visible(selected_tab, timeout_ms=800):
+            return True
+    except Exception:
+        pass
+
+    try:
+        tab = page.get_by_role("tab", name=re.compile(r"Undecided", re.I)).first
+        if tab.is_visible() and tab.get_attribute("aria-selected") == "true":
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def log_pipeline_failure_debug(page: Page, *, reason: str) -> None:
+    if not config.HOSTED_RUNTIME:
+        return
+
+    try:
+        url = page.url
+    except Exception:
+        url = "<unavailable>"
+    try:
+        title = page.title()
+    except Exception:
+        title = "<unavailable>"
+    log(f"Pipeline failure ({reason}): url={url!r} title={title!r}")
+
+    failure_dir = config.LOG_ROOT / "bc-playwright-failures"
+    failure_dir.mkdir(parents=True, exist_ok=True)
+    screenshot_path = failure_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
+    with contextlib.suppress(Exception):
+        page.screenshot(path=str(screenshot_path), full_page=True)
+        log(f"Saved failure screenshot: {screenshot_path}")
+
+
+def wait_for_pipeline_ready(page: Page, *, timeout_ms: int | None = None) -> None:
+    timeout_ms = timeout_ms or pipeline_ready_timeout_ms()
+    deadline = time.monotonic() + (timeout_ms / 1000)
+
+    while time.monotonic() < deadline:
+        ready, reason = pipeline_is_ready(page)
+        if ready:
+            log(f"Pipeline ready via {reason} (timeout budget={timeout_ms}ms)")
+            return
+        remaining_ms = int(max(0, (deadline - time.monotonic()) * 1000))
+        page.wait_for_timeout(min(PIPELINE_READY_POLL_MS, remaining_ms))
+
+    raise PlaywrightTimeoutError(f"Pipeline not ready within {timeout_ms}ms")
+
+
+def wait_for_pipeline_stability(page: Page) -> None:
+    """Ensure hosted Chromium survives the initial BC SPA hydration window."""
+    if not config.HOSTED_RUNTIME:
+        return
+
+    deadline = time.monotonic() + (HOSTED_PIPELINE_STABILITY_MS / 1000)
+    while time.monotonic() < deadline:
+        # A crashed renderer can still expose page.url; evaluate forces a round trip
+        # to the renderer and raises PlaywrightError when the target has crashed.
+        page.evaluate("document.readyState")
+        remaining_ms = int(max(0, (deadline - time.monotonic()) * 1000))
+        page.wait_for_timeout(min(PIPELINE_READY_POLL_MS, remaining_ms))
+
+    ready, reason = pipeline_is_ready(page)
+    if not ready:
+        raise PlaywrightTimeoutError(
+            "Pipeline stopped being ready during the hosted stability check"
+        )
+    log(f"Pipeline remained stable via {reason} for {HOSTED_PIPELINE_STABILITY_MS}ms")
+
+
+def navigate_to_pipeline(page: Page, *, non_interactive: bool = False) -> None:
+    try:
+        page.goto(START_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     except PlaywrightTimeoutError:
         if non_interactive:
             raise BuildingConnectedLoginRequired(LOGIN_REQUIRED_MESSAGE)
         pause_for_user("Timed out opening BuildingConnected. The browser may be waiting on Autodesk login.")
+        return
 
-    page.wait_for_timeout(3_000)
+    dismiss_browser_recovery_ui(page)
+
+    try:
+        wait_for_pipeline_ready(page)
+    except PlaywrightTimeoutError:
+        dismiss_browser_recovery_ui(page)
+        if looks_like_login_page(page):
+            if non_interactive:
+                raise BuildingConnectedLoginRequired(LOGIN_REQUIRED_MESSAGE)
+            pause_for_user(LOGIN_REQUIRED_MESSAGE)
+            return
+        log_pipeline_failure_debug(page, reason="pipeline_ready_timeout")
+        if non_interactive:
+            raise RuntimeError(
+                "BuildingConnected pipeline did not finish loading. "
+                "Login/MFA may be required, or the Bid Board UI may have changed."
+            )
+        pause_for_user("BuildingConnected pipeline did not finish loading.")
 
     if looks_like_login_page(page):
         if non_interactive:
@@ -170,27 +408,81 @@ def open_pipeline(page: Page, *, non_interactive: bool = False) -> None:
         pause_for_user(LOGIN_REQUIRED_MESSAGE)
 
 
+def click_undecided_tab(page: Page, *, non_interactive: bool = False) -> bool:
+    if is_on_undecided_view(page):
+        log("Already on Undecided view")
+        return True
+
+    per_strategy_timeout = undecided_tab_timeout_ms()
+    retry_delay_ms = 1_500
+    strategies = [
+        ("role_tab", lambda: page.get_by_role("tab", name=re.compile(r"Undecided", re.I)).first),
+        (
+            "tab_locator",
+            lambda: page.locator("[role='tab']").filter(
+                has_text=re.compile(r"Undecided", re.I)
+            ).first,
+        ),
+        ("text_undecided", lambda: page.get_by_text(re.compile(r"^Undecided$", re.I)).first),
+    ]
+
+    def try_all_strategies(attempt: int) -> str | None:
+        for name, locator_fn in strategies:
+            try:
+                locator = locator_fn()
+                locator.wait_for(state="visible", timeout=per_strategy_timeout)
+                locator.click()
+                page.wait_for_timeout(retry_delay_ms)
+                log(f"Undecided tab clicked via {name} (attempt {attempt})")
+                return name
+            except Exception:
+                continue
+        return None
+
+    if try_all_strategies(1):
+        return True
+
+    page.wait_for_timeout(retry_delay_ms)
+    if try_all_strategies(2):
+        return True
+
+    log("Reloading pipeline URL before final Undecided tab attempt")
+    navigate_to_pipeline(page, non_interactive=non_interactive)
+    return try_all_strategies(3) is not None
+
+
+def open_pipeline(page: Page, *, non_interactive: bool = False) -> None:
+    navigate_to_pipeline(page, non_interactive=non_interactive)
+
+
 def ensure_pipeline(page: Page, *, non_interactive: bool = False) -> None:
     log("Opening BuildingConnected pipeline")
-    open_pipeline(page, non_interactive=non_interactive)
+    navigate_to_pipeline(page, non_interactive=non_interactive)
 
-    if not click_text_if_visible(page, "Undecided", timeout=12_000):
-        if looks_like_login_page(page):
-            if non_interactive:
-                raise BuildingConnectedLoginRequired(LOGIN_REQUIRED_MESSAGE)
-            pause_for_user(LOGIN_REQUIRED_MESSAGE)
-            open_pipeline(page, non_interactive=non_interactive)
-            if click_text_if_visible(page, "Undecided", timeout=12_000):
-                return
+    if click_undecided_tab(page, non_interactive=non_interactive):
+        wait_for_pipeline_stability(page)
+        return
+
+    if looks_like_login_page(page):
         if non_interactive:
-            raise RuntimeError(
-                "Could not reach the BuildingConnected Undecided tab. "
-                "Login/MFA may be required, or the Bid Board UI may have changed."
-            )
-        pause_for_user("Could not click the Undecided tab. Login/MFA may be required.")
-        open_pipeline(page, non_interactive=non_interactive)
-        if not click_text_if_visible(page, "Undecided", timeout=12_000):
-            raise RuntimeError("Could not reach the Undecided bid board.")
+            raise BuildingConnectedLoginRequired(LOGIN_REQUIRED_MESSAGE)
+        pause_for_user(LOGIN_REQUIRED_MESSAGE)
+        navigate_to_pipeline(page, non_interactive=non_interactive)
+        if click_undecided_tab(page, non_interactive=non_interactive):
+            wait_for_pipeline_stability(page)
+            return
+
+    if non_interactive:
+        log_pipeline_failure_debug(page, reason="undecided_tab_unreachable")
+        raise RuntimeError(
+            "Could not reach the BuildingConnected Undecided tab. "
+            "Login/MFA may be required, or the Bid Board UI may have changed."
+        )
+    pause_for_user("Could not click the Undecided tab. Login/MFA may be required.")
+    navigate_to_pipeline(page, non_interactive=non_interactive)
+    if not click_undecided_tab(page, non_interactive=non_interactive):
+        log_pipeline_failure_debug(page, reason="undecided_tab_unreachable")
+        raise RuntimeError("Could not reach the Undecided bid board.")
 
 
 def sort_by_name(page: Page) -> None:
@@ -388,9 +680,17 @@ def click_project_text_fallback(page: Page, project: str) -> bool:
 
 def scroll_bid_board(page: Page) -> bool:
     before_text = page.locator("body").inner_text(timeout=5_000)[:4_000]
+    # Advance most of a viewport but keep ~1-2 rows of overlap so lazy-loaded
+    # projects are not skipped between scans.
     changed = page.evaluate(
         """
         () => {
+          const overlapPx = 140;
+          const stepFor = (clientHeight) => {
+            const h = clientHeight || 600;
+            return Math.max(240, Math.min(900, h - overlapPx));
+          };
+
           const candidates = [...document.querySelectorAll('div, main, section, [role=grid], [role=table]')]
             .map((el) => ({
               el,
@@ -404,13 +704,15 @@ def scroll_bid_board(page: Page) -> bool:
 
           const target = candidates[0];
           if (target) {
-            target.el.scrollTop = Math.min(target.top + 240, target.el.scrollHeight);
+            const step = stepFor(target.el.clientHeight);
+            target.el.scrollTop = Math.min(target.top + step, target.el.scrollHeight);
             return target.el.scrollTop !== target.top;
           }
 
           const doc = document.scrollingElement;
           const before = doc.scrollTop;
-          doc.scrollTop = Math.min(before + 240, doc.scrollHeight);
+          const step = stepFor(doc.clientHeight || window.innerHeight);
+          doc.scrollTop = Math.min(before + step, doc.scrollHeight);
           return doc.scrollTop !== before;
         }
         """
@@ -418,7 +720,7 @@ def scroll_bid_board(page: Page) -> bool:
     page.wait_for_timeout(2_200)
 
     if not changed:
-        page.mouse.wheel(0, 360)
+        page.mouse.wheel(0, 720)
         page.wait_for_timeout(2_200)
 
     after_wheel = page.locator("body").inner_text(timeout=5_000)[:4_000]
@@ -431,17 +733,94 @@ def scroll_bid_board(page: Page) -> bool:
     return after_key != before_text
 
 
+def detail_page_matches_project(page: Page, project: str) -> bool:
+    """True when the open opportunity page is the intended project (full name available)."""
+    if not is_project_detail_url(page.url):
+        return False
+
+    try:
+        title = page.title()
+    except Exception:
+        title = ""
+    if title and likely_match(project, title):
+        return True
+
+    try:
+        body = page.locator("body").inner_text(timeout=5_000)
+    except Exception:
+        body = ""
+
+    for line in (ln.strip() for ln in body.splitlines() if ln.strip()):
+        if len(line) > 260:
+            continue
+        if likely_match(project, line):
+            return True
+
+    if body and likely_match(project, body[:2_000]):
+        return True
+
+    candidates = [c for c in dom_candidates(page, project) if not bad_candidate_text(c.combined)]
+    return bool(candidates and likely_match(project, candidates[0].combined))
+
+
+def accept_opened_project(
+    page: Page,
+    project: str,
+    *,
+    matched_text: str = "",
+    tag: str = "",
+    href: str = "",
+) -> Candidate | None:
+    if not is_project_detail_url(page.url):
+        return None
+    if not detail_page_matches_project(page, project):
+        log(
+            "Detail page does not match target project "
+            f"(opened text: {(matched_text or page.url)[:120]})"
+        )
+        return None
+    log("Confirmed opened detail page matches target project")
+    return Candidate(matched_text or project, "", "", tag or "DETAIL", 2.0, href or page.url)
+
+
+def return_to_undecided_board(page: Page, *, non_interactive: bool = True) -> None:
+    """Leave a wrong/partial opportunity page and get back to the Undecided list."""
+    log("Returning to Undecided bid board after mismatched open")
+    with contextlib.suppress(Exception):
+        page.go_back(wait_until="commit", timeout=NAV_TIMEOUT_MS)
+        page.wait_for_timeout(2_000)
+
+    if is_project_detail_url(page.url) or "pipeline" not in (page.url or "").lower():
+        ensure_pipeline(page, non_interactive=non_interactive)
+        sort_by_name(page)
+        return
+
+    if not click_undecided_tab(page, non_interactive=non_interactive):
+        ensure_pipeline(page, non_interactive=non_interactive)
+        sort_by_name(page)
+
+
 def open_exact_project_text(page: Page, project: str) -> Candidate | None:
+    # Only consider row-sized nodes. Fat ancestors can contain the target name
+    # somewhere below the fold while their first opportunity link is a different project.
     boxes = page.evaluate(
         """
         (project) => {
           const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
           const target = clean(project).toLowerCase();
+          if (!target) return [];
           const out = [];
+          const nodes = [...document.querySelectorAll(
+            '[role=row], tr, a[href*="/opportunities/"], [class*=Row], [class*=row]'
+          )];
 
-          for (const el of document.querySelectorAll('a,button,[role=row],tr,div,span')) {
+          for (const el of nodes) {
             const text = clean(el.innerText || el.textContent || '');
+            if (text.length < 10 || text.length > 500) continue;
             if (!text.toLowerCase().includes(target)) continue;
+
+            const lower = text.toLowerCase();
+            if (lower.includes('filtered by') || lower.includes('assign name bid date')) continue;
 
             const rect = el.getBoundingClientRect();
             const visible =
@@ -453,7 +832,13 @@ def open_exact_project_text(page: Page, project: str) -> Candidate | None:
               rect.left <= window.innerWidth;
             if (!visible) continue;
 
-            const link = el.closest('a[href*="/opportunities/"]') || el.querySelector?.('a[href*="/opportunities/"]');
+            let link = null;
+            if (el.matches?.('a[href*="/opportunities/"]')) {
+              link = el;
+            } else {
+              link = el.querySelector?.('a[href*="/opportunities/"]') || null;
+            }
+
             out.push({
               tag: el.tagName,
               text,
@@ -470,18 +855,38 @@ def open_exact_project_text(page: Page, project: str) -> Candidate | None:
     )
 
     for box in boxes:
+        label = row_label(box["text"])
+        if norm(project) not in norm(box["text"]) and not likely_match(project, label):
+            continue
+
         log(f"Found exact project text in visible DOM: {box['text'][:120]}")
+        opened = False
         if box["href"]:
             page.goto(box["href"], wait_until="commit", timeout=NAV_TIMEOUT_MS)
             page.wait_for_timeout(2_500)
-            if is_project_detail_url(page.url):
-                return Candidate(project, "", "", box["tag"], 2.0, box["href"])
+            opened = is_project_detail_url(page.url)
 
-        for click_count in (1, 2):
-            page.mouse.click(box["x"], box["y"], click_count=click_count)
-            page.wait_for_timeout(2_500)
-            if is_project_detail_url(page.url):
-                return Candidate(project, "", "", box["tag"], 2.0)
+        if not opened:
+            for click_count in (1, 2):
+                page.mouse.click(box["x"], box["y"], click_count=click_count)
+                page.wait_for_timeout(2_500)
+                if is_project_detail_url(page.url):
+                    opened = True
+                    break
+
+        if not opened:
+            continue
+
+        accepted = accept_opened_project(
+            page,
+            project,
+            matched_text=box["text"],
+            tag=box["tag"],
+            href=box["href"] or page.url,
+        )
+        if accepted:
+            return accepted
+        return_to_undecided_board(page)
 
     try:
         locator = page.get_by_text(project, exact=False).first
@@ -490,14 +895,22 @@ def open_exact_project_text(page: Page, project: str) -> Candidate | None:
         page.wait_for_timeout(800)
         log("Found exact project text outside visible-row scan")
 
+        opened = False
         for click_count in (1, 2):
             locator.click(timeout=4_000, click_count=click_count)
             page.wait_for_timeout(2_500)
             if is_project_detail_url(page.url):
-                return Candidate(project, "", "", "TEXT", 2.0)
+                opened = True
+                break
 
-        if click_project_text_fallback(page, project):
-            return Candidate(project, "", "", "TEXT", 2.0)
+        if not opened and click_project_text_fallback(page, project):
+            opened = is_project_detail_url(page.url)
+
+        if opened:
+            accepted = accept_opened_project(page, project, matched_text=project, tag="TEXT")
+            if accepted:
+                return accepted
+            return_to_undecided_board(page)
     except Exception:
         return None
 
@@ -712,14 +1125,30 @@ def find_and_open_project(page: Page, project: str) -> Candidate | None:
         rows = visible_bid_rows(page)
         print_visible_bid_rows(scan, rows)
 
+        mismatched_open = False
         for row in rows:
             if not row_matches_project(project, row):
                 continue
 
             log(f"Matched visible row: {row_label(row.text)}")
             if open_bid_row(page, row) or click_project_text_fallback(page, project):
-                return Candidate(row.text, "", "", row.tag, 2.0, row.href)
+                accepted = accept_opened_project(
+                    page,
+                    project,
+                    matched_text=row.text,
+                    tag=row.tag,
+                    href=row.href,
+                )
+                if accepted:
+                    return accepted
+                return_to_undecided_board(page)
+                mismatched_open = True
+                log("Matching row opened wrong project; continuing scan")
+                break
             log("Matching row found, but project detail page did not open")
+
+        if mismatched_open:
+            continue
 
         if scroll_bid_board(page):
             log("Scrolled bid board")
@@ -806,6 +1235,7 @@ def visible_file_items(page: Page) -> list[dict[str, str]]:
           const out = [];
 
           for (const el of nodes) {
+            if (el.closest('[data-id="file-list-tools"]')) continue;
             const text = clean(el.innerText || el.textContent || '');
             const title = clean(el.getAttribute('title'));
             const aria = clean(el.getAttribute('aria-label'));
@@ -868,8 +1298,16 @@ def extract_file_name(raw: str) -> str:
     return (match.group(1) if match else text).strip()
 
 
+SELECTABLE_FILE_EXT_RE = re.compile(r"\.(pdf|zip|docx?|xlsx?|dwg|rvt|txt)\b", re.I)
+ANY_FILE_EXT_RE = re.compile(r"\.[a-z0-9]{2,5}\b", re.I)
+
+
 def is_probable_file(name: str) -> bool:
-    return bool(re.search(r"\.(pdf|zip|docx?|xlsx?|dwg|rvt|txt)\b", name, re.I))
+    return bool(SELECTABLE_FILE_EXT_RE.search(name or ""))
+
+
+def has_file_extension(name: str) -> bool:
+    return bool(ANY_FILE_EXT_RE.search(name or ""))
 
 
 def item_looks_like_folder(item: dict[str, str]) -> bool:
@@ -915,9 +1353,17 @@ def classified_file_items(page: Page) -> list[tuple[str, str, str, str]]:
     for item in items:
         raw = item["text"] or item["title"] or item["aria"]
         name = extract_file_name(raw)
-        if not name or name.lower() in {"download all", "plan room pro"}:
+        if not name or name.lower() in {
+            "download all",
+            "download selected",
+            "plan room pro",
+        }:
             continue
-        if "download all" in name.lower() or "copy all to internal files" in name.lower():
+        if (
+            "download all" in name.lower()
+            or "download selected" in name.lower()
+            or "copy all to internal files" in name.lower()
+        ):
             continue
         if " name indicator size date modified " in f" {name.lower()} ":
             continue
@@ -927,13 +1373,23 @@ def classified_file_items(page: Page) -> list[tuple[str, str, str, str]]:
             continue
         seen.add(name.lower())
 
-        kind = "file" if is_probable_file(name) else "folder"
-        if kind == "folder":
+        # Never treat extension-bearing rows (e.g. .mpp) as folders.
+        if is_probable_file(name):
+            kind = "file"
+            skip, reason = should_skip_file(name)
+            action = "SKIP" if skip else "SELECT"
+        elif has_file_extension(name):
+            kind = "file"
+            action = "SKIP"
+            reason = "non-selectable file type"
+        elif item_looks_like_folder(item) or not has_file_extension(name):
+            kind = "folder"
             skip, reason = should_skip_folder(name)
             action = "SKIP" if skip else "OPEN"
         else:
-            skip, reason = should_skip_file(name)
-            action = "SKIP" if skip else "SELECT"
+            kind = "file"
+            action = "SKIP"
+            reason = "unclassified file item"
 
         classified.append((kind, action, name, reason))
 
@@ -960,26 +1416,42 @@ def print_classification_rows(rows: list[tuple[str, str, str, str]]) -> None:
         print(f"  {action:6} {kind:6} {name} ({reason})")
 
 
-def select_file_by_name(page: Page, file_name: str) -> bool:
-    return bool(
-        page.evaluate(
+def select_file_by_name(page: Page, file_name: str) -> tuple[bool, str]:
+    """Try to check the Files-tab checkbox for file_name. Returns (ok, reason)."""
+    for attempt in range(1, 4):
+        result = page.evaluate(
             """
             async (fileName) => {
               const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
               const target = clean(fileName).toLowerCase();
               const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-              const checked = (el) =>
-                Boolean(el.checked) ||
-                el.getAttribute('aria-checked') === 'true' ||
-                el.className?.toString().toLowerCase().includes('checked');
+              const checked = (el) => {
+                const className = (el?.className?.toString() || '').toLowerCase();
+                return (
+                  Boolean(el?.checked) ||
+                  el?.getAttribute?.('aria-checked') === 'true' ||
+                  (className.includes('checked') && !className.includes('unchecked'))
+                );
+              };
 
-              const nodes = [...document.querySelectorAll('div, span, a, [role=row], tr, [class*=row], [class*=Row]')]
+              const rowChecked = (row) => {
+                const boxes = [...row.querySelectorAll(
+                  'input[type=checkbox], [role=checkbox], [aria-checked]'
+                )];
+                return boxes.some(checked);
+              };
+
+              const nodes = [...document.querySelectorAll(
+                '[role=row], tr, [class*=row], [class*=Row], div, span, a'
+              )]
                 .map((el) => ({ el, text: clean(el.innerText || el.textContent || '') }))
                 .filter(({ text }) => {
                   const lower = text.toLowerCase();
                   return lower === target || lower.startsWith(`${target} `);
                 })
                 .sort((a, b) => a.text.length - b.text.length);
+
+              if (!nodes.length) return { ok: false, reason: 'row not found' };
 
               for (const { el } of nodes) {
                 const containers = [];
@@ -989,23 +1461,40 @@ def select_file_by_name(page: Page, file_name: str) -> bool:
                 }
 
                 const row = containers.find((candidate) =>
-                  candidate.matches?.('[role=row], tr, [class*=row], [class*=Row]')
+                  candidate.matches?.('[role=row], tr')
+                ) || containers.find((candidate) =>
+                  candidate.matches?.('[class*=row], [class*=Row]')
                 ) || containers.find((candidate) => {
                   const rect = candidate.getBoundingClientRect();
-                  return rect.width > 250 && rect.height > 18;
-                }) || el.parentElement || el;
+                  return rect.width > 250 && rect.height > 18 && rect.height < 120;
+                }) || el;
+
+                try {
+                  row.scrollIntoView({ block: 'center', inline: 'nearest' });
+                } catch (e) {}
+                await sleep(200);
 
                 const checkbox = row.querySelector(
                   'input[type=checkbox], [role=checkbox], [aria-checked]'
                 );
-
-                if (checkbox) {
+                if (!checkbox) {
+                  // Fall through to coordinate click near the left edge.
+                } else {
                   checkbox.scrollIntoView({ block: 'center' });
                   if (!checked(checkbox)) {
                     checkbox.click();
-                    await sleep(150);
+                    await sleep(400);
                   }
-                  if (checked(checkbox)) return true;
+                  if (checked(checkbox) || rowChecked(row)) {
+                    return { ok: true, reason: 'checkbox checked' };
+                  }
+                  // Some BC controls toggle on a parent button/div, not the input itself.
+                  const clickable = checkbox.closest('button, [role=checkbox], label') || checkbox;
+                  clickable.click();
+                  await sleep(400);
+                  if (checked(checkbox) || rowChecked(row)) {
+                    return { ok: true, reason: 'checkbox checked via wrapper' };
+                  }
                 }
 
                 const rect = row.getBoundingClientRect();
@@ -1015,21 +1504,29 @@ def select_file_by_name(page: Page, file_name: str) -> bool:
                   const targetAtPoint = document.elementFromPoint(x, y);
                   if (targetAtPoint) {
                     targetAtPoint.click();
-                    await sleep(150);
-                    const nowChecked = row.querySelector(
-                      'input[type=checkbox]:checked, [role=checkbox][aria-checked=true], [aria-checked=true]'
-                    );
-                    if (nowChecked) return true;
+                    await sleep(400);
+                    if (rowChecked(row)) {
+                      return { ok: true, reason: 'checked via coordinate click' };
+                    }
                   }
                 }
               }
 
-              return false;
+              return { ok: false, reason: 'checkbox not checked' };
             }
             """,
             file_name,
         )
-    )
+        if result and result.get("ok"):
+            return True, str(result.get("reason") or "selected")
+
+        reason = str((result or {}).get("reason") or "unknown")
+        if attempt < 3:
+            page.wait_for_timeout(500)
+            continue
+        return False, reason
+
+    return False, "unknown"
 
 
 def select_classified_files(page: Page, rows: list[tuple[str, str, str, str]], label: str) -> list[str]:
@@ -1048,11 +1545,12 @@ def select_classified_files(page: Page, rows: list[tuple[str, str, str, str]], l
             continue
         seen.add(key)
 
-        if select_file_by_name(page, file_name):
+        ok, reason = select_file_by_name(page, file_name)
+        if ok:
             selected.append(file_name)
             print(f"  SELECTED {file_name}")
         else:
-            print(f"  FAILED   {file_name}")
+            print(f"  FAILED   {file_name} ({reason})")
 
     page.wait_for_timeout(1_000)
     return selected
@@ -1084,6 +1582,11 @@ def open_folder_by_name(page: Page, folder_name: str) -> bool:
 
 
 def return_to_files_root(page: Page, root_url: str) -> None:
+    # BuildingConnected expands folders inline without changing the URL.
+    # Going back in that state leaves the project and clears its selections.
+    if page.url == root_url:
+        return
+
     try:
         page.go_back(wait_until="commit", timeout=10_000)
         page.wait_for_timeout(2_000)
@@ -1146,7 +1649,6 @@ def select_allowed_files(page: Page) -> list[str]:
 
     root_rows = classified_file_items(page)
     root_names = {name.lower() for _kind, _action, name, _reason in root_rows}
-    selected.extend(select_classified_files(page, root_rows, "root files"))
 
     folders = [
         name
@@ -1154,9 +1656,12 @@ def select_allowed_files(page: Page) -> list[str]:
         if kind == "folder" and action == "OPEN"
     ]
 
+    # Select root files before expanding folders so no reload or navigation is
+    # required after the first selection.
+    selected.extend(select_classified_files(page, root_rows, "root files"))
+
     root_url = page.url
     for folder_name in folders:
-        reset_files_view(page)
         if not open_folder_by_name(page, folder_name):
             print(f"\nSelection Preview ({folder_name}): -- could not open folder --")
             continue
@@ -1200,131 +1705,140 @@ def unique_download_path(filename: str) -> Path:
     raise RuntimeError(f"Could not create unique download path for {filename}")
 
 
-def selected_download_button(page: Page) -> Locator | ElementHandle | None:
+def selected_download_button(
+    page: Page,
+    *,
+    selection_expected: bool = False,
+) -> Locator | None:
+    if not selection_expected:
+        return None
+
     candidates = [
-        page.get_by_role("button", name=re.compile(r"download\s+selected", re.I)).first,
-        page.locator("button:has-text('Download Selected')").first,
-        page.locator("a:has-text('Download Selected')").first,
-        page.locator("[role=button]:has-text('Download Selected')").first,
-        page.get_by_text(re.compile(r"download\s+selected", re.I)).first,
+        (
+            'data-testid="download-all-bttn"',
+            page.locator('[data-testid="download-all-bttn"]').first,
+        ),
+        (
+            'role="button" name="Download Selected"',
+            page.get_by_role(
+                "button",
+                name=re.compile(r"^\s*download\s+selected\s*$", re.I),
+            ).first,
+        ),
+        (
+            "button text",
+            page.locator("button:has-text('Download Selected')").first,
+        ),
+        (
+            "input value",
+            page.locator(
+                "input[type=button][value='Download Selected' i], "
+                "input[type=submit][value='Download Selected' i]"
+            ).first,
+        ),
     ]
 
-    for candidate in candidates:
+    for source, candidate in candidates:
         try:
             candidate.wait_for(state="visible", timeout=4_000)
-            return candidate
+            label = candidate.evaluate(
+                """
+                (el) => (
+                  el.innerText ||
+                  el.textContent ||
+                  el.value ||
+                  el.getAttribute('aria-label') ||
+                  ''
+                ).replace(/\\s+/g, ' ').trim()
+                """
+            )
+            if re.fullmatch(r"download\s+selected", str(label), re.I):
+                log(f"Confirmed Download Selected control via {source}")
+                return candidate
         except Exception:
             continue
 
-    handle = page.evaluate_handle(
-        """
-        () => {
-          const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-          const nodes = [...document.querySelectorAll('button, a, [role=button], div, span')];
-          const matches = nodes
-            .map((el) => {
-              const label = clean([
-                el.innerText || el.textContent || '',
-                el.getAttribute('aria-label') || '',
-                el.getAttribute('title') || '',
-              ].join(' '));
-              return { el, label };
-            })
-            .filter(({ el, label }) => {
-              if (!label.includes('download selected') || label.includes('download all')) return false;
-              const rect = el.getBoundingClientRect();
-              const visible = rect.width > 1 && rect.height > 1 && getComputedStyle(el).visibility !== 'hidden';
-              return visible;
-            })
-            .sort((a, b) => a.label.length - b.label.length);
-
-          const match = matches[0];
-          if (!match) return null;
-
-          return match.el.closest('button, a, [role=button]') || match.el;
-        }
-        """
-    )
-    element = handle.as_element()
-    if element:
-        return element
-
-    toolbar_handle = page.evaluate_handle(
-        """
-        () => {
-          const checked = document.querySelectorAll(
-            'input[type=checkbox]:checked, [aria-checked=true]'
-          ).length;
-          if (!checked) return null;
-
-          const toolbar = document.querySelector('[data-id="file-list-tools"]');
-          if (!toolbar) return null;
-
-          const candidates = [...toolbar.querySelectorAll('div, button, a, [role=button]')]
-            .map((el) => ({ el, rect: el.getBoundingClientRect() }))
-            .filter(({ rect }) => rect.width > 20 && rect.height > 20)
-            .sort((a, b) => a.rect.left - b.rect.left || a.rect.top - b.rect.top);
-
-          return candidates[0]?.el || null;
-        }
-        """
-    )
-    return toolbar_handle.as_element()
+    return None
 
 
-def selected_download_diagnostics(page: Page) -> str:
+def selected_download_diagnostics(page: Page, expected_selected: int) -> str:
     details = page.evaluate(
         """
         () => {
           const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-          const controls = [...document.querySelectorAll('button, a, [role=button], [aria-label], [title]')]
-            .map((el) => clean([
-              el.innerText || el.textContent || '',
-              el.getAttribute('aria-label') || '',
-              el.getAttribute('title') || '',
-            ].join(' ')))
-            .filter((label) => /download/i.test(label))
-            .slice(0, 12);
+          const target = document.querySelector('[data-testid="download-all-bttn"]');
+          const targetStyle = target ? getComputedStyle(target) : null;
+          const targetDetails = target ? {
+            label: clean(
+              target.innerText ||
+              target.textContent ||
+              target.value ||
+              target.getAttribute('aria-label') ||
+              ''
+            ),
+            visible:
+              target.getBoundingClientRect().width > 0 &&
+              target.getBoundingClientRect().height > 0 &&
+              targetStyle.visibility !== 'hidden' &&
+              targetStyle.display !== 'none',
+            disabled: Boolean(target.disabled) || target.getAttribute('aria-disabled') === 'true',
+          } : null;
 
-          const checked = [...document.querySelectorAll('input[type=checkbox]:checked, [aria-checked=true]')].length;
-          return { controls, checked };
+          const isChecked = (el) => {
+            const className = (el?.className?.toString() || '').toLowerCase();
+            return (
+              Boolean(el?.checked) ||
+              el?.getAttribute?.('aria-checked') === 'true' ||
+              (className.includes('checked') && !className.includes('unchecked'))
+            );
+          };
+          const checked = [...document.querySelectorAll(
+            'input[type=checkbox], [role=checkbox], [aria-checked]'
+          )].filter(isChecked).length;
+          return { targetDetails, checked };
         }
         """
     )
-    controls = details.get("controls") or []
+    target = details.get("targetDetails")
     checked = details.get("checked", 0)
-    labels = "; ".join(controls) if controls else "none"
-    return f"visible download controls: {labels}; checked controls: {checked}"
+    return (
+        f"target control: {target or 'not found'}; "
+        f"verified file names: {expected_selected}; checked controls: {checked}"
+    )
 
 
-def click_selected_download_button(page: Page, button: Locator | ElementHandle) -> None:
-    try:
-        button.click()
-    except Exception:
-        page.evaluate(
-            """
-            (el) => {
-              el.scrollIntoView({ block: 'center', inline: 'center' });
-              el.click();
-            }
-            """,
-            button,
+def click_selected_download_button(button: Locator) -> None:
+    label = button.evaluate(
+        """
+        (el) => (
+          el.innerText ||
+          el.textContent ||
+          el.value ||
+          el.getAttribute('aria-label') ||
+          ''
+        ).replace(/\\s+/g, ' ').trim()
+        """
+    )
+    if not re.fullmatch(r"download\s+selected", str(label), re.I):
+        raise RuntimeError(
+            f"Download control changed to {label!r}; refusing to click it."
         )
+    button.click(timeout=10_000)
 
 
-def download_selected_files(page: Page) -> Path:
+def download_selected_files(page: Page, selected_count: int) -> Path:
     log("Clicking selected-files download control")
     page.wait_for_timeout(1_000)
-    button = selected_download_button(page)
+    button = selected_download_button(page, selection_expected=selected_count > 0)
     if button is None:
-        diagnostics = selected_download_diagnostics(page)
+        diagnostics = selected_download_diagnostics(page, selected_count)
         raise RuntimeError(
             "No selected-files download button was found; refusing to click Download All. "
             f"Diagnostics: {diagnostics}"
         )
 
     with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as download_info:
-        click_selected_download_button(page, button)
+        click_selected_download_button(button)
 
     download = download_info.value
     target = unique_download_path(download.suggested_filename)
@@ -1334,6 +1848,14 @@ def download_selected_files(page: Page) -> Path:
 
 
 def launch_context(pw, browser: str, headless: bool):
+    # Headed Chromium is unstable for BC under Railway's Xvfb display, while the
+    # same persistent profile is stable with Chromium headless. The noVNC login
+    # bootstrap launches Chromium directly and remains headed for login/MFA.
+    effective_headless = (
+        config.HOSTED_RUNTIME
+        or headless
+        or config.env_bool("CQE_PLAYWRIGHT_HEADLESS", False)
+    )
     channels = {
         "auto": ["chrome", "msedge", None],
         "chrome": ["chrome"],
@@ -1346,13 +1868,14 @@ def launch_context(pw, browser: str, headless: bool):
         try:
             label = channel or "bundled chromium"
             profile_dir = PROFILE_DIR / (channel or "chromium")
-            log(f"Launching {label} with profile {profile_dir}")
+            mode = "headless" if effective_headless else "headed"
+            log(f"Launching {label} {mode} with profile {profile_dir}")
             kwargs = {
                 "user_data_dir": str(profile_dir),
-                "headless": headless,
+                "headless": effective_headless,
                 "accept_downloads": True,
-                "args": LAUNCH_ARGS,
-                "viewport": None,
+                "args": playwright_launch_args(),
+                "viewport": HOSTED_VIEWPORT if config.HOSTED_RUNTIME else None,
             }
             if channel:
                 kwargs["channel"] = channel
@@ -1384,6 +1907,45 @@ def base_result(project: str) -> dict[str, object]:
         "matched_text": "",
         "error": "",
     }
+
+
+def page_is_unusable(page: Page, result: dict[str, object] | None = None) -> bool:
+    try:
+        if page.is_closed():
+            return True
+    except Exception:
+        return True
+
+    if result and result.get("status") == "ERROR":
+        error = str(result.get("error") or "").lower()
+        crash_markers = (
+            "page crashed",
+            "target closed",
+            "context destroyed",
+            "has been closed",
+            "execution context was destroyed",
+        )
+        if any(marker in error for marker in crash_markers):
+            return True
+
+    try:
+        page.evaluate("document.readyState")
+    except Exception:
+        return True
+    return False
+
+
+def open_fresh_page(context, page: Page | None = None) -> Page:
+    # Persistent Chromium contexts may close when their final page is closed,
+    # so create the replacement before disposing of the failed page.
+    fresh = context.new_page()
+    fresh.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+    if page is not None:
+        with contextlib.suppress(Exception):
+            if not page.is_closed():
+                page.close()
+    log("Opened fresh browser page after crash/unusable state")
+    return fresh
 
 
 def process_project(
@@ -1444,7 +2006,9 @@ def process_project(
             result["files"] = selected
             if download_files:
                 if selected:
-                    result["download_path"] = str(download_selected_files(page))
+                    result["download_path"] = str(
+                        download_selected_files(page, len(selected))
+                    )
                 else:
                     log("Download skipped: no files were selected.")
         else:

@@ -1,22 +1,29 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import tempfile
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Flask, render_template, abort, send_file, url_for, redirect, request
 from werkzeug.datastructures import FileStorage
 from werkzeug.utils import secure_filename
 
-from app.db import get_connection
+from app import config
+from app.db import get_connection, init_db
 from app.importer import import_project_from_source
 from app.models import ImportItem
 
 import re
 
 
-DB_PATH = Path("data") / "cqe.db"
-STORAGE_ROOT = Path("data") / "uploads"
+DB_PATH = config.DB_PATH
+STORAGE_ROOT = config.STORAGE_ROOT
 ALLOWED_MANUAL_UPLOAD_EXTENSIONS = {".pdf", ".zip"}
+WORKFLOW_SCRIPT = config.PROJECT_ROOT / "scripts" / "run_daily_workflow.py"
 
 PROJECT_STATUSES = [
     "Needs Review",
@@ -31,6 +38,70 @@ PROJECT_CONTACT_TYPES = {
     "architect": "Architect",
     "general-contractor": "General Contractor",
 }
+
+
+def stored_file_path(value: str | Path) -> Path:
+    return config.resolve_project_path(value)
+
+
+def workflow_token_authorized() -> bool:
+    expected_token = os.getenv("DAILY_WORKFLOW_TOKEN", "").strip()
+    if not expected_token:
+        return True
+
+    auth_header = request.headers.get("Authorization", "").strip()
+    header_token = request.headers.get("X-Daily-Workflow-Token", "").strip()
+    query_token = request.args.get("token", "").strip()
+
+    return (
+        auth_header == f"Bearer {expected_token}"
+        or header_token == expected_token
+        or query_token == expected_token
+    )
+
+
+def acquire_workflow_lock() -> int | None:
+    lock_path = config.WORKFLOW_LOCK_FILE
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        return os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return None
+    except OSError:
+        return None
+
+
+def write_workflow_lock(fd: int) -> None:
+    with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
+        lock_file.write(
+            f"pid={os.getpid()}\n"
+            f"started_at={datetime.now(timezone.utc).isoformat()}\n"
+        )
+
+
+def release_workflow_lock() -> None:
+    try:
+        config.WORKFLOW_LOCK_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def start_daily_workflow(args: list[str]) -> None:
+    def run() -> None:
+        try:
+            command = [sys.executable, str(WORKFLOW_SCRIPT), *args]
+            print(f"[daily-workflow] Starting: {' '.join(command)}", flush=True)
+            completed = subprocess.run(command, cwd=config.PROJECT_ROOT)
+            print(
+                f"[daily-workflow] Finished with exit code {completed.returncode}",
+                flush=True,
+            )
+        finally:
+            release_workflow_lock()
+
+    thread = threading.Thread(target=run, name="daily-workflow", daemon=True)
+    thread.start()
 
 
 def blank_project_contact(contact_type: str) -> dict:
@@ -263,6 +334,9 @@ def import_item_for_existing_project(project_row) -> ImportItem:
 
 
 def create_app() -> Flask:
+    config.ensure_runtime_dirs()
+    init_db(DB_PATH)
+
     app = Flask(__name__)
 
     @app.route("/")
@@ -925,7 +999,7 @@ def create_app() -> Flask:
         if not upload:
             abort(404)
 
-        file_path = Path(upload["stored_path"])
+        file_path = stored_file_path(upload["stored_path"])
 
         if not file_path.exists():
             abort(404)
@@ -953,7 +1027,7 @@ def create_app() -> Flask:
         if not upload:
             abort(404)
 
-        file_path = Path(upload["stored_path"])
+        file_path = stored_file_path(upload["stored_path"])
 
         if not file_path.exists():
             abort(404)
@@ -1261,7 +1335,7 @@ def create_app() -> Flask:
         highlight_term = rows[0]["search_term"]
 
         for row in rows:
-            file_path = Path(row["stored_path"])
+            file_path = stored_file_path(row["stored_path"])
 
             if not file_path.exists():
                 continue
@@ -1343,7 +1417,7 @@ def create_app() -> Flask:
                     (int(result_id),),
                 ).fetchone()
 
-        file_path = Path(upload["stored_path"])
+        file_path = stored_file_path(upload["stored_path"])
 
         if not file_path.exists():
             abort(404)
@@ -1387,6 +1461,67 @@ def create_app() -> Flask:
             pdf_url=pdf_url,
         )
 
+    @app.route("/internal/daily-workflow/run", methods=["POST"])
+    def trigger_daily_workflow():
+        if not workflow_token_authorized():
+            abort(401)
+
+        payload = request.get_json(silent=True) or {}
+
+        def request_value(name: str) -> object:
+            alternate_name = name.replace("_", "-")
+            if name in payload:
+                return payload[name]
+            if alternate_name in payload:
+                return payload[alternate_name]
+            return request.args.get(name) or request.args.get(alternate_name)
+
+        def request_flag(name: str) -> bool:
+            value = request_value(name)
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return False
+            return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+        workflow_args: list[str] = []
+        run_day = request_value("run_day")
+        if run_day:
+            run_day = str(run_day).strip().lower()
+            if run_day not in {
+                "monday",
+                "tuesday",
+                "wednesday",
+                "thursday",
+                "friday",
+                "saturday",
+                "sunday",
+            }:
+                abort(400, "Invalid run_day")
+            workflow_args.extend(["--run-day", run_day])
+
+        if request_flag("dry_run"):
+            workflow_args.append("--dry-run")
+        if request_flag("no_sheet_update"):
+            workflow_args.append("--no-sheet-update")
+
+        lock_fd = acquire_workflow_lock()
+        if lock_fd is None:
+            return {
+                "status": "already_running",
+                "lock_file": str(config.WORKFLOW_LOCK_FILE),
+            }, 409
+
+        write_workflow_lock(lock_fd)
+        start_daily_workflow(workflow_args)
+
+        return {
+            "status": "started",
+            "args": workflow_args,
+            "lock_file": str(config.WORKFLOW_LOCK_FILE),
+            "log_root": str(config.LOG_ROOT),
+        }, 202
+
 
     return app
 
@@ -1395,4 +1530,4 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)

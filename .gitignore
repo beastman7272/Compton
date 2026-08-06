@@ -14,6 +14,9 @@ playwright_cc_profile/
 playwright_bc_profile/
 chrome_bc_debug/
 
+playwright_bc_profile_chromium_min.zip
+playwright_bc_profile_chrome.zip
+
 #Ignore SQLite db
 data/cqe.db
 
@@ -25,11 +28,16 @@ sa.json
 credentials.json
 cqe_state.json
 orchestrator_token.json
+data/credentials/
 
 # Ignore playwright results
 playwright_results.json
+run_state.json
+comet_prompt.txt
+daily-workflow.lock
 
 # Ignore generated workflow logs
 logs/
 
 data/uploads/
+data/downloads/

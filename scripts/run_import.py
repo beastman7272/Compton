@@ -15,16 +15,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from google.auth.exceptions import RefreshError
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-
 from app.importer import import_project_from_source
 from app.models import ImportItem, ImportResult
 from app.search import index_upload_ids
 from app.contact_extraction import extract_contacts_for_upload_ids
+from app import config
+from app.google_runtime import build_sheets_service
 
 from dotenv import load_dotenv
 
@@ -36,30 +32,16 @@ def env_value(name: str, default: str) -> str:
     return os.getenv(name, default).strip()
 
 
-def env_path(name: str, default: Path) -> Path:
-    value = os.getenv(name)
-    if not value:
-        return default
-
-    path = Path(value.strip())
-    if path.is_absolute():
-        return path
-
-    return PROJECT_ROOT / path
-
-
 # ── Paths ────────────────────────────────────────────────────────────────
 
-DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "cqe.db"
-DEFAULT_STORAGE_ROOT = PROJECT_ROOT / "data" / "uploads"
-DOWNLOADS = Path.home() / "Downloads"
+DEFAULT_DB_PATH = config.DB_PATH
+DEFAULT_STORAGE_ROOT = config.STORAGE_ROOT
+DOWNLOADS = config.DOWNLOADS_DIR
 
 
 # ── Google Sheets config ─────────────────────────────────────────────────
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-TOKEN_FILE = env_path("GOOGLE_TOKEN_FILE", PROJECT_ROOT / "orchestrator_token.json")
-CREDENTIALS_FILE = env_path("GOOGLE_CREDENTIALS_FILE", PROJECT_ROOT / "credentials.json")
 
 # BuildingConnected / Bid Board sheet
 BC_SHEET_ID = env_value("BID_BOARD_SHEET_ID", "14PMQx_SiNkSX2gLWtfjsIEpovmADJpv1f53bhICQKfY")
@@ -262,34 +244,10 @@ def update_summary(summary: RunSummary, result: ImportResult) -> None:
 # ── Google Sheets helpers ────────────────────────────────────────────────
 
 def get_sheets_service():
-    creds = None
-
-    if TOKEN_FILE.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except RefreshError:
-                TOKEN_FILE.unlink(missing_ok=True)
-                creds = None
-
-        if not creds or not creds.valid:
-            if not CREDENTIALS_FILE.exists():
-                raise FileNotFoundError(
-                    f"Missing {CREDENTIALS_FILE}. Download OAuth credentials first."
-                )
-
-            flow = InstalledAppFlow.from_client_secrets_file(
-                str(CREDENTIALS_FILE),
-                SCOPES,
-            )
-            creds = flow.run_local_server(port=0)
-
-        TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
-
-    return build("sheets", "v4", credentials=creds)
+    return build_sheets_service(
+        SCOPES,
+        token_filename="orchestrator_token.json",
+    )
 
 
 def read_values(service, sheet_id: str, range_name: str) -> list[list[str]]:

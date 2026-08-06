@@ -27,21 +27,19 @@ import os
 import sys
 import re
 import argparse
+import contextlib
 import json
 from datetime import datetime
 from difflib import SequenceMatcher
 
+from app import config
+from app.google_runtime import build_sheets_service
+
 try:
-    from google.auth.exceptions import RefreshError
-    from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    from google.auth.transport.requests import Request
-    from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
 except ImportError:
-    print("Missing dependencies. Run:")
-    print("  pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client")
-    sys.exit(1)
+    class HttpError(Exception):
+        """Fallback so import-only checks can run without Google API packages."""
 
 
 def configure_text_io():
@@ -80,15 +78,19 @@ configure_text_io()
 
 # ── Config ────────────────────────────────────────────────────────────────
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-TOKEN_FILE = "orchestrator_token.json"
-CREDENTIALS_FILE = "credentials.json"
 
-EMAILS_SHEET_ID = "1mhCWXwSUtV-AbBxLmEBS-jezkeujVPMYY9RD5ENlPFU"
-BID_BOARD_SHEET_ID = "14PMQx_SiNkSX2gLWtfjsIEpovmADJpv1f53bhICQKfY"
+def env_value(name, default):
+    return os.getenv(name, default).strip()
 
-COMET_PROMPT_FILE = "comet_prompt.txt"
-RUN_STATE_FILE = "run_state.json"
-PLAYWRIGHT_RESULTS_FILE = "playwright_results.json"
+
+EMAILS_SHEET_ID = env_value("EMAILS_SHEET_ID", "1mhCWXwSUtV-AbBxLmEBS-jezkeujVPMYY9RD5ENlPFU")
+EMAILS_TAB_NAME = env_value("EMAILS_TAB_NAME", "Sheet1")
+BID_BOARD_SHEET_ID = env_value("BID_BOARD_SHEET_ID", "14PMQx_SiNkSX2gLWtfjsIEpovmADJpv1f53bhICQKfY")
+BID_BOARD_TAB_NAME = env_value("BID_BOARD_TAB_NAME", "Sheet1")
+
+COMET_PROMPT_FILE = config.COMET_PROMPT_FILE
+RUN_STATE_FILE = config.RUN_STATE_FILE
+PLAYWRIGHT_RESULTS_FILE = config.PLAYWRIGHT_RESULTS_FILE
 
 SKIP_BRANDS = []
 # SKIP_BRANDS = ["advance auto parts", "aldi", "autozone", "barnes & noble", "basss pro shops", "bath & body works", 
@@ -122,31 +124,18 @@ SKIP_FILE_KEYWORDS = SKIP_FOLDER_KEYWORDS + [
 
 # ── Auth ──────────────────────────────────────────────────────────────────
 def get_sheets_service():
-    creds = None
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except RefreshError:
-                if os.path.exists(TOKEN_FILE):
-                    os.remove(TOKEN_FILE)
-                creds = None
-
-        if not creds or not creds.valid:
-            if not os.path.exists(CREDENTIALS_FILE):
-                print(f"ERROR: {CREDENTIALS_FILE} not found.")
-                print("Download OAuth credentials from Google Cloud Console.")
-                sys.exit(1)
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open_utf8(TOKEN_FILE, "w") as token:
-            token.write(creds.to_json())
-    return build("sheets", "v4", credentials=creds)
+    return build_sheets_service(
+        SCOPES,
+        token_filename="orchestrator_token.json",
+    )
 
 
 # ── Sheet helpers ─────────────────────────────────────────────────────────
+def sheet_range(tab_name: str, range_name: str) -> str:
+    escaped_tab_name = tab_name.replace("'", "''")
+    return f"'{escaped_tab_name}'!{range_name}"
+
+
 def read_sheet(service, sheet_id, range_str):
     result = service.spreadsheets().values().get(
         spreadsheetId=sheet_id, range=range_str
@@ -251,8 +240,8 @@ def phase1_process(service):
     print("PHASE 1 — Pre-process queue & generate Comet prompt")
     print("=" * 70)
 
-    email_rows = read_sheet(service, EMAILS_SHEET_ID, "Sheet1!A1:F1000")
-    bb_rows = read_sheet(service, BID_BOARD_SHEET_ID, "Sheet1!A1:G1000")
+    email_rows = read_sheet(service, EMAILS_SHEET_ID, sheet_range(EMAILS_TAB_NAME, "A1:F1000"))
+    bb_rows = read_sheet(service, BID_BOARD_SHEET_ID, sheet_range(BID_BOARD_TAB_NAME, "A1:G1000"))
 
     if len(email_rows) < 2:
         print("No data in email sheet.")
@@ -300,14 +289,14 @@ def phase1_process(service):
 
         # Branch C
         if category == "other":
-            status_updates.append({"range": f"Sheet1!F{sheet_row}", "values": [["Needs Review"]]})
+            status_updates.append({"range": sheet_range(EMAILS_TAB_NAME, f"F{sheet_row}"), "values": [["Needs Review"]]})
             print(" → Needs Review")
             continue
 
         # Skip filter
         skip, reason = should_skip(cn)
         if skip:
-            status_updates.append({"range": f"Sheet1!F{sheet_row}", "values": [["Skipped"]]})
+            status_updates.append({"range": sheet_range(EMAILS_TAB_NAME, f"F{sheet_row}"), "values": [["Skipped"]]})
             print(f" → Skipped ({reason})")
             continue
 
@@ -322,7 +311,7 @@ def phase1_process(service):
                     "doc_links": doc_links,
                     "bb_row": bb_idx + 2, "email_row": sheet_row,
                 })
-            status_updates.append({"range": f"Sheet1!F{sheet_row}", "values": [["Processed"]]})
+            status_updates.append({"range": sheet_range(EMAILS_TAB_NAME, f"F{sheet_row}"), "values": [["Processed"]]})
             print(f" → Dedup (see row {first['email_row']})")
             continue
 
@@ -336,7 +325,7 @@ def phase1_process(service):
                     "project": cn, "scope": scope, "doc_links": doc_links,
                     "bb_row": bb_idx + 2, "email_row": sheet_row,
                 })
-                status_updates.append({"range": f"Sheet1!F{sheet_row}", "values": [["Awaiting Comet"]]})
+                status_updates.append({"range": sheet_range(EMAILS_TAB_NAME, f"F{sheet_row}"), "values": [["Awaiting Comet"]]})
                 print(f" → Branch B (append to BB row {bb_idx + 2})")
             else:
                 comet_tasks.append({
@@ -345,7 +334,7 @@ def phase1_process(service):
                     "email_row": sheet_row,
                     "note": "Logged via document update — no prior project record found.",
                 })
-                status_updates.append({"range": f"Sheet1!F{sheet_row}", "values": [["Awaiting Comet"]]})
+                status_updates.append({"range": sheet_range(EMAILS_TAB_NAME, f"F{sheet_row}"), "values": [["Awaiting Comet"]]})
                 print(f" → Branch B→A (no BB match, treating as new)")
 
         elif category == "new project":
@@ -355,7 +344,7 @@ def phase1_process(service):
                     "project": cn, "scope": scope, "doc_links": doc_links,
                     "bb_row": bb_idx + 2, "email_row": sheet_row,
                 })
-                status_updates.append({"range": f"Sheet1!F{sheet_row}", "values": [["Awaiting Comet"]]})
+                status_updates.append({"range": sheet_range(EMAILS_TAB_NAME, f"F{sheet_row}"), "values": [["Awaiting Comet"]]})
                 print(f" → Exists on BB row {bb_idx + 2}, download only")
             else:
                 comet_tasks.append({
@@ -363,10 +352,10 @@ def phase1_process(service):
                     "project": cn, "scope": scope,
                     "email_row": sheet_row,
                 })
-                status_updates.append({"range": f"Sheet1!F{sheet_row}", "values": [["Awaiting Comet"]]})
+                status_updates.append({"range": sheet_range(EMAILS_TAB_NAME, f"F{sheet_row}"), "values": [["Awaiting Comet"]]})
                 print(f" → New project, needs Comet")
         else:
-            status_updates.append({"range": f"Sheet1!F{sheet_row}", "values": [["Needs Review"]]})
+            status_updates.append({"range": sheet_range(EMAILS_TAB_NAME, f"F{sheet_row}"), "values": [["Needs Review"]]})
             print(f" → Unknown category, Needs Review")
             continue
 
@@ -529,7 +518,7 @@ def phase3_finalize(service):
         print("\nNo pending tasks in run state.")
         return
 
-    bb_rows = read_sheet(service, BID_BOARD_SHEET_ID, "Sheet1!A1:G1000")
+    bb_rows = read_sheet(service, BID_BOARD_SHEET_ID, sheet_range(BID_BOARD_TAB_NAME, "A1:G1000"))
     bb_data = bb_rows[1:] if len(bb_rows) > 1 else []
 
     print(f"\n{len(tasks)} project(s) to finalize.")
@@ -605,13 +594,13 @@ def finalize_from_paste(service, tasks, bb_data):
         if not matched_result:
             print(f"\n  {task['project']}: No matching Comet result")
             update_cell(service, EMAILS_SHEET_ID,
-                        f"Sheet1!F{task['email_row']}", "Processing Error")
+                        sheet_range(EMAILS_TAB_NAME, f"F{task['email_row']}"), "Processing Error")
             continue
 
         apply_result(service, task, matched_result, bb_data)
 
         if task["action"] == "new_project":
-            bb_rows = read_sheet(service, BID_BOARD_SHEET_ID, "Sheet1!A1:G1000")
+            bb_rows = read_sheet(service, BID_BOARD_SHEET_ID, sheet_range(BID_BOARD_TAB_NAME, "A1:G1000"))
             bb_data = bb_rows[1:] if len(bb_rows) > 1 else []
 
 
@@ -645,7 +634,7 @@ def finalize_interactive(service, tasks, bb_data):
 
         apply_result(service, task, result, bb_data)
         if task["action"] == "new_project":
-            bb_rows = read_sheet(service, BID_BOARD_SHEET_ID, "Sheet1!A1:G1000")
+            bb_rows = read_sheet(service, BID_BOARD_SHEET_ID, sheet_range(BID_BOARD_TAB_NAME, "A1:G1000"))
             bb_data = bb_rows[1:] if len(bb_rows) > 1 else []
 
 
@@ -662,8 +651,8 @@ def apply_result(service, task, result, bb_data):
         status = result.get("status")
         error_note = result.get("error") or "Project not found on BuildingConnected"
         print(f"  → {project}: {status} — Processing Error")
-        update_cell(service, EMAILS_SHEET_ID, f"Sheet1!F{email_row}", "Processing Error")
-        append_row(service, BID_BOARD_SHEET_ID, "Sheet1!A:G", [
+        update_cell(service, EMAILS_SHEET_ID, sheet_range(EMAILS_TAB_NAME, f"F{email_row}"), "Processing Error")
+        append_row(service, BID_BOARD_SHEET_ID, sheet_range(BID_BOARD_TAB_NAME, "A:G"), [
             project, scope, "--", "--", "--", error_note, "Processing Error"
         ])
         return
@@ -673,18 +662,18 @@ def apply_result(service, task, result, bb_data):
         bb_idx = bb_row_num - 2
         existing = bb_data[bb_idx][5] if len(bb_data[bb_idx]) > 5 else ""
         updated = (existing + ", " + files_str) if existing else files_str
-        update_cell(service, BID_BOARD_SHEET_ID, f"Sheet1!F{bb_row_num}", updated)
-        update_cell(service, EMAILS_SHEET_ID, f"Sheet1!F{email_row}", "Processed")
+        update_cell(service, BID_BOARD_SHEET_ID, sheet_range(BID_BOARD_TAB_NAME, f"F{bb_row_num}"), updated)
+        update_cell(service, EMAILS_SHEET_ID, sheet_range(EMAILS_TAB_NAME, f"F{email_row}"), "Processed")
         print(f"  → {project}: Files appended to BB row {bb_row_num}")
 
     elif task["action"] == "new_project":
         location = result.get("location", "--")
         size = result.get("project_size", "--")
         due = format_bid_date_for_sheet(result.get("due_date", "--"))
-        append_row(service, BID_BOARD_SHEET_ID, "Sheet1!A:G", [
+        append_row(service, BID_BOARD_SHEET_ID, sheet_range(BID_BOARD_TAB_NAME, "A:G"), [
             project, scope, location, size, due, files_str, ""
         ])
-        update_cell(service, EMAILS_SHEET_ID, f"Sheet1!F{email_row}", "Processed")
+        update_cell(service, EMAILS_SHEET_ID, sheet_range(EMAILS_TAB_NAME, f"F{email_row}"), "Processed")
         print(f"  → {project}: New BB row + Processed")
 
     else:
@@ -693,15 +682,15 @@ def apply_result(service, task, result, bb_data):
             bb_row_num = bb_idx + 2
             existing = bb_data[bb_idx][5] if len(bb_data[bb_idx]) > 5 else ""
             updated = (existing + ", " + files_str) if existing else files_str
-            update_cell(service, BID_BOARD_SHEET_ID, f"Sheet1!F{bb_row_num}", updated)
+            update_cell(service, BID_BOARD_SHEET_ID, sheet_range(BID_BOARD_TAB_NAME, f"F{bb_row_num}"), updated)
         else:
             location = result.get("location", "--")
             size = result.get("project_size", "--")
             due = format_bid_date_for_sheet(result.get("due_date", "--"))
-            append_row(service, BID_BOARD_SHEET_ID, "Sheet1!A:G", [
+            append_row(service, BID_BOARD_SHEET_ID, sheet_range(BID_BOARD_TAB_NAME, "A:G"), [
                 project, scope, location, size, due, files_str, ""
             ])
-        update_cell(service, EMAILS_SHEET_ID, f"Sheet1!F{email_row}", "Processed")
+        update_cell(service, EMAILS_SHEET_ID, sheet_range(EMAILS_TAB_NAME, f"F{email_row}"), "Processed")
         print(f"  → {project}: Updated + Processed")
 
 
@@ -709,13 +698,15 @@ def apply_result(service, task, result, bb_data):
 def phase2_playwright_run(
     service,
     *,
-    browser="chrome",
+    browser=None,
     cdp_url=None,
     headless=False,
     select_files=False,
     download_files=False,
     apply_results=False,
 ):
+    if browser is None:
+        browser = config.default_playwright_browser()
     print("\n" + "=" * 70)
     print("PHASE 2 — Playwright: process BuildingConnected browser tasks")
     print("=" * 70)
@@ -743,6 +734,8 @@ def phase2_playwright_run(
             NAV_TIMEOUT_MS,
             attach_context,
             launch_context,
+            open_fresh_page,
+            page_is_unusable,
             process_project,
         )
     except ImportError as exc:
@@ -775,6 +768,28 @@ def phase2_playwright_run(
                     non_interactive=True,
                     reuse_current_page=False,
                 )
+
+                if (
+                    not cdp_url
+                    and config.HOSTED_RUNTIME
+                    and result.get("status") == "ERROR"
+                    and page_is_unusable(page, result)
+                ):
+                    print("  Browser target crashed; retrying task once in a fresh browser context")
+                    with contextlib.suppress(Exception):
+                        context.close()
+                    context = launch_context(pw, browser, headless)
+                    context.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+                    page = context.pages[0] if context.pages else context.new_page()
+                    result = process_project(
+                        page,
+                        project,
+                        select_files=select_files or download_files,
+                        download_files=download_files,
+                        non_interactive=True,
+                        reuse_current_page=False,
+                    )
+
                 results.append({"task": task, "result": result})
 
                 status = result.get("status", "ERROR")
@@ -785,11 +800,24 @@ def phase2_playwright_run(
                     print(f"  Download: {result['download_path']}")
                 if result.get("error"):
                     print(f"  Error: {result['error']}")
+                if result.get("status") == "ERROR" and idx < len(tasks):
+                    if not cdp_url and config.HOSTED_RUNTIME and page_is_unusable(page, result):
+                        print("  Recovering with a fresh browser context before next task")
+                        with contextlib.suppress(Exception):
+                            context.close()
+                        context = launch_context(pw, browser, headless)
+                        context.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+                        page = context.pages[0] if context.pages else context.new_page()
+                    else:
+                        print("  Recovering with a fresh browser page before next task (prior ERROR)")
+                        page = open_fresh_page(context, page)
         finally:
             if not cdp_url:
-                context.close()
+                with contextlib.suppress(Exception):
+                    context.close()
             elif browser_instance:
-                browser_instance.close()
+                with contextlib.suppress(Exception):
+                    browser_instance.close()
 
     with open_utf8(PLAYWRIGHT_RESULTS_FILE, "w") as f:
         json.dump(results, f, indent=2)
@@ -812,7 +840,7 @@ def phase2_playwright_run(
         print("Review playwright_results.json, fix the issue, then rerun the workflow.")
         return False
 
-    bb_rows = read_sheet(service, BID_BOARD_SHEET_ID, "Sheet1!A1:G1000")
+    bb_rows = read_sheet(service, BID_BOARD_SHEET_ID, sheet_range(BID_BOARD_TAB_NAME, "A1:G1000"))
     bb_data = bb_rows[1:] if len(bb_rows) > 1 else []
 
     print("\nApplying Playwright results to Sheets...")
@@ -821,7 +849,7 @@ def phase2_playwright_run(
         result = item["result"]
         apply_result(service, task, result, bb_data)
         if task["action"] == "new_project":
-            bb_rows = read_sheet(service, BID_BOARD_SHEET_ID, "Sheet1!A1:G1000")
+            bb_rows = read_sheet(service, BID_BOARD_SHEET_ID, sheet_range(BID_BOARD_TAB_NAME, "A1:G1000"))
             bb_data = bb_rows[1:] if len(bb_rows) > 1 else []
 
     os.remove(RUN_STATE_FILE)
@@ -829,7 +857,9 @@ def phase2_playwright_run(
     return True
 
 
-def check_buildingconnected_login(*, browser="chrome", cdp_url=None, headless=False):
+def check_buildingconnected_login(*, browser=None, cdp_url=None, headless=False):
+    if browser is None:
+        browser = config.default_playwright_browser()
     print("\n" + "=" * 70)
     print("BUILDINGCONNECTED LOGIN CHECK")
     print("=" * 70)
@@ -878,8 +908,8 @@ def check_buildingconnected_login(*, browser="chrome", cdp_url=None, headless=Fa
 
 # ── Status ────────────────────────────────────────────────────────────────
 def show_status(service):
-    email_rows = read_sheet(service, EMAILS_SHEET_ID, "Sheet1!A1:F1000")
-    bb_rows = read_sheet(service, BID_BOARD_SHEET_ID, "Sheet1!A1:G1000")
+    email_rows = read_sheet(service, EMAILS_SHEET_ID, sheet_range(EMAILS_TAB_NAME, "A1:F1000"))
+    bb_rows = read_sheet(service, BID_BOARD_SHEET_ID, sheet_range(BID_BOARD_TAB_NAME, "A1:G1000"))
 
     print("\n" + "=" * 70)
     print("QUEUE STATUS")
@@ -924,7 +954,8 @@ def main():
     parser.add_argument("--check-buildingconnected-login", action="store_true",
                         help="Open the Playwright profile and verify BuildingConnected is logged in")
     parser.add_argument("--playwright-browser", choices=["auto", "chrome", "msedge", "chromium"],
-                        default="chrome", help="Browser channel for Playwright runs")
+                        default=config.default_playwright_browser(),
+                        help="Browser channel for Playwright runs")
     parser.add_argument("--playwright-cdp-url",
                         help="Attach Playwright to an existing Chrome/Edge debugging session")
     parser.add_argument("--playwright-headless", action="store_true",
@@ -937,8 +968,9 @@ def main():
                         help="Apply Playwright results to Sheets and clear run_state.json")
     args = parser.parse_args()
 
+    default_browser = config.default_playwright_browser()
     playwright_flag_without_run = (
-        args.playwright_browser != "chrome"
+        args.playwright_browser != default_browser
         or args.playwright_cdp_url
         or args.playwright_headless
         or args.playwright_select_files

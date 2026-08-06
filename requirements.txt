@@ -10,3 +10,4 @@ openpyxl
 pymupdf
 openai
 flask
+gunicorn

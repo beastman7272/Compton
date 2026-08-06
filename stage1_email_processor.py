@@ -4,54 +4,33 @@ import re
 import html
 from datetime import datetime
 
-from google.auth.exceptions import RefreshError
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
+from app.google_runtime import build_oauth_services
 
 # API Scopes for Gmail (Read/Modify) and Google Sheets (Read/Write)
 SCOPES = [
     'https://www.googleapis.com/auth/gmail.modify',
     'https://www.googleapis.com/auth/spreadsheets'
 ]
-TOKEN_FILE = 'stage1_token.json'
-CREDENTIALS_FILE = 'credentials.json'
 
 # The ID of the bid_board_emails Google Sheet
-SPREADSHEET_ID = '1mhCWXwSUtV-AbBxLmEBS-jezkeujVPMYY9RD5ENlPFU'
-PREFERRED_SHEET_NAME = 'bid_board_emails'
+def env_value(name, default):
+    return os.getenv(name, default).strip()
+
+
+SPREADSHEET_ID = env_value('EMAILS_SHEET_ID', '1mhCWXwSUtV-AbBxLmEBS-jezkeujVPMYY9RD5ENlPFU')
+PREFERRED_SHEET_NAME = env_value('EMAILS_TAB_NAME', 'bid_board_emails')
 COLUMNS_RANGE = 'A:E'
 
 def authenticate_google_services():
     """Authenticates and returns the Gmail and Sheets service objects."""
-    creds = None
-    # Use a dedicated token so this script's Gmail scope is not overwritten
-    # by other scripts that only request Google Sheets permissions.
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-    
-    # If there are no (valid) credentials available, let the user log in.
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except RefreshError:
-                if os.path.exists(TOKEN_FILE):
-                    os.remove(TOKEN_FILE)
-                creds = None
-
-        if not creds or not creds.valid:
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-        # Save the credentials for the next run
-        with open(TOKEN_FILE, 'w') as token:
-            token.write(creds.to_json())
-
-    gmail_service = build('gmail', 'v1', credentials=creds)
-    sheets_service = build('sheets', 'v4', credentials=creds)
-    
-    return gmail_service, sheets_service
+    # Gmail access must use OAuth user credentials; the same token can also
+    # write to Sheets because this workflow consumes Gmail and appends rows.
+    return build_oauth_services(
+        ("gmail", "sheets"),
+        SCOPES,
+        token_filename="stage1_token.json",
+        use_file_env=False,
+    )
 
 def get_sheet_range(sheets_service):
     """Returns a valid A:E range for the preferred sheet or the first tab."""
@@ -81,7 +60,7 @@ def get_sheet_range(sheets_service):
 
 def get_unread_bid_emails(gmail_service):
     """Fetches unread emails from the specific sender from the last 24 hours."""
-    query = "from:beastman7272@gmail.com is:unread newer_than:1d"
+    query = "from:team@buildingconnected.com is:unread newer_than:1d"  #team@buildingconnected.com  #info@comptonsales.com
     results = gmail_service.users().messages().list(userId='me', q=query).execute()
     return results.get('messages', [])
 
@@ -139,53 +118,114 @@ def get_email_content(gmail_service, msg_id):
 
     return subject, body
 
-def clean_project_name(project_name):
-    """Removes email UI text and formatting artifacts from an extracted project name."""
-    stop_markers = [
-        r'View this RFP',
-        r'View the RFP',
-        r'Already know if',
-        r'Project Details',
-        r'Client Details',
-        r'Location:',
-        r'Bid Due:',
-        r'Manage all your Bids',
-        r'Start now',
-        r'Bidding',
-        r'Not Bidding',
-        r'Not Sure',
-        r'\[image:',
-        r'<https?://',
-    ]
+PROJECT_STOP_MARKERS = [
+    r'View this RFP',
+    r'View the RFP',
+    r'Already know if',
+    r'Project Details',
+    r'Client Details',
+    r'Location:',
+    r'Bid Due:',
+    r'Manage all your Bids',
+    r'Start now',
+    r'Bidding',
+    r'Not Bidding',
+    r'Not Sure',
+    r'\[image:',
+    r'<https?://',
+]
 
-    project_name = re.sub(
-        rf"\s*(?:{'|'.join(stop_markers)}).*$",
+BLOCKED_PROJECT_LABELS = {
+    'attachments',
+    'bid due',
+    'client details',
+    'date',
+    'from',
+    'lead',
+    'location',
+    'project details',
+    'reply-to',
+    'subject',
+    'to',
+    'to all',
+}
+
+
+def clean_text_fragment(value):
+    """Removes forwarding/Markdown decoration without changing title punctuation."""
+    value = html.unescape(value or "")
+    value = re.sub(r"^[\s\"`*_•\-:]+", "", value).strip()
+    value = re.sub(r"[\s\"`*_•\-:]+$", "", value).strip()
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def split_project_scope(value):
+    """Splits BuildingConnected's ``Project*: Scope`` visual convention."""
+    value = re.sub(
+        rf"\s*(?:{'|'.join(PROJECT_STOP_MARKERS)}).*$",
         "",
-        project_name,
+        value or "",
         flags=re.IGNORECASE,
-    )
+    ).strip()
 
-    # BuildingConnected sometimes appends a trade/package scope after the title,
-    # e.g. "Project Name*: Firestopping" or "Project Name: Glass & Glazing".
-    scope_match = re.match(r"^(?P<base>.+?)\*+\s*:\s*(?P<scope>.+)$", project_name)
-    if scope_match:
-        project_name = scope_match.group("base").strip()
+    # Plain-text forwarded messages retain Markdown emphasis around the project:
+    # "*Gustavo's*: Roofing". Prefer that explicit boundary. For HTML-derived
+    # text, the same content may be rendered as "Gustavo's: Roofing".
+    match = re.match(r"^(?P<project>.+?)\*+\s*:\s*(?P<scope>.+)$", value)
+    if not match and ':' in value:
+        project, scope = value.rsplit(':', 1)
+        match_values = (project, scope)
+    elif match:
+        match_values = (match.group("project"), match.group("scope"))
     else:
-        colon_match = re.match(r"^(?P<base>.+?)\s*:\s*(?P<scope>.+)$", project_name)
-        if colon_match:
-            scope_text = colon_match.group("scope").strip()
-            scope_word_count = len(re.findall(r"[A-Za-z0-9&/+-]+", scope_text))
-            looks_like_scope = (
-                scope_word_count <= 5
-                and not re.search(r"\d", scope_text)
-                and re.fullmatch(r"[A-Za-z&/,+\-() ]+", scope_text) is not None
-            )
-            if looks_like_scope:
-                project_name = colon_match.group("base").strip()
+        match_values = (value, "")
 
-    project_name = re.sub(r"^[\s'\"`*•\-:]+", "", project_name).strip()
-    project_name = re.sub(r"[\s'\"`*•\-:]+$", "", project_name).strip()
-    return re.sub(r"\s+", " ", project_name).strip()
+    project = clean_text_fragment(match_values[0])
+    scope = clean_text_fragment(match_values[1])
+    return project, scope
+
+
+def clean_project_name(project_name):
+    """Returns only the normalized project portion of a candidate value."""
+    project, _ = split_project_scope(project_name)
+    return project
+
+
+def extract_subject_project(subject):
+    """Extracts a complete BuildingConnected project name from the subject."""
+    if not subject or re.search(r"\.\.\.|…", subject):
+        return "Unknown"
+
+    normalized = re.sub(r"^(?:(?:fwd?|re)\s*:\s*)+", "", subject, flags=re.IGNORECASE)
+    match = re.search(
+        r"\bbid invite:\s*(?P<project>.+?)\s+project\s*$",
+        normalized,
+        re.IGNORECASE,
+    )
+    if not match:
+        return "Unknown"
+
+    candidate = clean_text_fragment(match.group("project"))
+    return candidate if is_valid_project_name(candidate) else "Unknown"
+
+
+def extract_invitation_project(body):
+    """Extracts project and scope from the title following the invite phrase."""
+    normalized_body = re.sub(r"\s+", " ", body or "").strip()
+    match = re.search(
+        r"has invited you\s+to bid on\s+(.+?)"
+        r"(?=\s+View (?:this|the) RFP\b|\s+Already know if\b|"
+        r"\s+Project Details\b|\s+Client Details\b|$)",
+        normalized_body,
+        re.IGNORECASE,
+    )
+    if not match:
+        return "Unknown", ""
+
+    project, scope = split_project_scope(match.group(1))
+    if not is_valid_project_name(project):
+        return "Unknown", ""
+    return project, scope
 
 
 def normalize_project_key(project_name):
@@ -201,7 +241,7 @@ def normalize_project_key(project_name):
 
 
 def extract_colon_project_name(lines):
-    """Find a likely 'Project Name: Scope' line and return the project name."""
+    """Last-resort parser for a likely 'Project Name: Scope' line."""
     skip_prefixes = (
         'location:',
         'bid due:',
@@ -253,7 +293,9 @@ def extract_colon_project_name(lines):
         if not line:
             continue
 
-        lower = line.lower()
+        # Formatting such as "*Bid Due: *August 14" must not bypass labels.
+        normalized_line = re.sub(r"[*_`]+", "", line).strip()
+        lower = normalized_line.lower()
 
         if any(lower.startswith(prefix) for prefix in skip_prefixes):
             continue
@@ -261,19 +303,19 @@ def extract_colon_project_name(lines):
         if any(re.search(pattern, lower, re.IGNORECASE) for pattern in skip_line_patterns):
             continue
 
-        if ':' not in line:
+        if ':' not in normalized_line:
             continue
 
-        left, right = line.split(':', 1)
+        left, right = normalized_line.rsplit(':', 1)
         left = left.strip()
         right = right.strip()
 
         if not left or not right:
             continue
 
-        # Ignore obvious labels and sentence-like intros
+        # Ignore sentence-like intros, but allow legitimate one-word projects.
         left_word_count = len(left.split())
-        if left_word_count < 2 or left_word_count > 12:
+        if left_word_count > 20:
             continue
 
         if any(re.search(pattern, left, re.IGNORECASE) for pattern in blocked_left_patterns):
@@ -298,6 +340,10 @@ def extract_colon_project_name(lines):
 def is_valid_project_name(project_name):
     """Rejects obvious UI text accidentally captured as a project name."""
     if not project_name or project_name == "Unknown":
+        return False
+
+    normalized_label = re.sub(r"[*_`]+", "", project_name).strip(" :").lower()
+    if normalized_label in BLOCKED_PROJECT_LABELS:
         return False
 
     invalid_patterns = [
@@ -362,17 +408,25 @@ def classify_email(subject, body):
 
     return "Other"
 
-def extract_project_details(body):
-    """Extracts the project name and any associated document filenames."""
+def extract_project_details(body, subject=""):
+    """Extracts a validated project name and associated document filenames."""
     project_name = "Unknown"
     lines = [line.strip() for line in body.splitlines() if line.strip()]
+    body_project, _ = extract_invitation_project(body)
+    subject_project = extract_subject_project(subject)
 
-    # First try the strongest visual pattern: "Project Name: Scope"
-    project_name = extract_colon_project_name(lines)
+    if body_project != "Unknown":
+        # The invitation body matches the canonical Bid Board name. Work scope
+        # (for example Roofing or Caulking) is deliberately discarded because
+        # multiple scope invites can point to the same project and files.
+        project_name = body_project
+    elif subject_project != "Unknown":
+        # Subjects are only a fallback because forwarding clients can truncate
+        # or otherwise alter them.
+        project_name = subject_project
 
-    # If that fails, fall back to phrase-based extraction
-    if project_name == "Unknown":
-
+    # Legacy update/addendum emails may not use the invitation template.
+    if project_name == "Unknown" and body_project == "Unknown" and subject_project == "Unknown":
         stop_patterns = [
             r'^addendum\b',
             r'^due date\b',
@@ -381,7 +435,6 @@ def extract_project_details(body):
             r'^good afternoon\b',
             r'^good evening\b',
             r'^please\b',
-            r'^\*\*',
             r'^reply to\b',
             r'^send bid\b',
             r'^view (this|the) rfp\b',
@@ -394,7 +447,8 @@ def extract_project_details(body):
         ]
 
         def looks_like_stop_line(text):
-            return any(re.search(p, text, re.IGNORECASE) for p in stop_patterns)
+            normalized = re.sub(r"[*_`]+", "", text).strip()
+            return any(re.search(pattern, normalized, re.IGNORECASE) for pattern in stop_patterns)
 
         for index, line in enumerate(lines):
             if re.search(r'message about\s*$', line, re.IGNORECASE):
@@ -404,30 +458,12 @@ def extract_project_details(body):
                         project_name = candidate
                         break
 
-            inline_match = re.search(r'has invited you to bid on\s*(.*)$', line, re.IGNORECASE)
-            if inline_match:
-                trailing_text = inline_match.group(1).strip()
-                if trailing_text:
-                    candidate = clean_project_name(trailing_text)
-                    if is_valid_project_name(candidate) and not looks_like_stop_line(candidate):
-                        project_name = candidate
-                        break
-                elif index + 1 < len(lines):
-                    candidate = clean_project_name(lines[index + 1])
-                    if is_valid_project_name(candidate) and not looks_like_stop_line(candidate):
-                        project_name = candidate
-                        break
-
-            if re.search(r'^bid on\s*$', line, re.IGNORECASE) and index + 1 < len(lines):
-                candidate = clean_project_name(lines[index + 1])
-                if is_valid_project_name(candidate) and not looks_like_stop_line(candidate):
-                    project_name = candidate
-                    break
-
             inline_match = re.search(
-                r'about\s+(.+?)(?=:\s|Addendum\b|Due Date\b|Attachments?:\b|Good Morning\b|Good Afternoon\b|Good Evening\b|Please\b|Reply to\b|Send Bid\b|$)',
+                r'about\s+(.+?)(?=:\s|Addendum\b|Due Date\b|Attachments?:\b|'
+                r'Good Morning\b|Good Afternoon\b|Good Evening\b|Please\b|'
+                r'Reply to\b|Send Bid\b|$)',
                 line,
-                re.IGNORECASE
+                re.IGNORECASE,
             )
             if inline_match:
                 candidate = clean_project_name(inline_match.group(1).strip())
@@ -435,23 +471,29 @@ def extract_project_details(body):
                     project_name = candidate
                     break
 
-        project_name = clean_project_name(project_name)
-
-        if not is_valid_project_name(project_name):
+        if project_name == "Unknown":
             normalized_body = re.sub(r'\s+', ' ', body).strip()
             project_patterns = [
-                r'has invited you to bid on\s+(.+?)(?=\s+View (?:this|the) RFP|\s+Already know if|\s+Project Details|\s+Location:|\s+Client Details|\s+Addendum\b|\s+Due Date\b|\s+Attachments?:\b|\s*$)',
-                r'message about\s+(.+?)(?=\s+Addendum\b|\s+Due Date\b|\s+Attachments?:\b|\s+Good Morning\b|\s+Good Afternoon\b|\s+Good Evening\b|\s+Please\b|\s+Reply to\b|\s+Send Bid\b|\s+View (?:this|the) RFP|\s+Project Details|\s*$)',
-                r'about\s+(.+?)(?=:\s|\s+View (?:this|the) RFP|\s+Project Details|\s+Addendum\b|\s+Due Date\b|\s+Attachments?:\b|\s*$)',
+                r'message about\s+(.+?)(?=\s+Addendum\b|\s+Due Date\b|'
+                r'\s+Attachments?:\b|\s+Good Morning\b|\s+Good Afternoon\b|'
+                r'\s+Good Evening\b|\s+Please\b|\s+Reply to\b|\s+Send Bid\b|'
+                r'\s+View (?:this|the) RFP|\s+Project Details|\s*$)',
+                r'about\s+(.+?)(?=:\s|\s+View (?:this|the) RFP|'
+                r'\s+Project Details|\s+Addendum\b|\s+Due Date\b|'
+                r'\s+Attachments?:\b|\s*$)',
             ]
-
             for pattern in project_patterns:
                 match = re.search(pattern, normalized_body, re.IGNORECASE)
                 if match:
-                    candidate_name = clean_project_name(match.group(1).strip())
-                    if is_valid_project_name(candidate_name) and not looks_like_stop_line(candidate_name):
-                        project_name = candidate_name
+                    candidate = clean_project_name(match.group(1).strip())
+                    if is_valid_project_name(candidate) and not looks_like_stop_line(candidate):
+                        project_name = candidate
                         break
+
+        # Generic colon parsing is intentionally last because forwarded
+        # messages contain many metadata labels using the same punctuation.
+        if project_name == "Unknown":
+            project_name = extract_colon_project_name(lines)
 
     # Extract Filenames
     file_pattern = r'([a-zA-Z0-9_\-\s\(\)]+\.(?:pdf|zip|docx|xlsx)|Addendum\s*#?\d+)'
@@ -489,7 +531,10 @@ def process_pipeline():
                 mark_as_read(gmail_service, msg_id)
                 continue
             
-            project_name, docs = extract_project_details(body)
+            project_name, docs = extract_project_details(body, subject)
+            if not is_valid_project_name(clean_project_name(project_name)):
+                category = "Other"
+                project_name = "Unknown"
             project_key = normalize_project_key(project_name)
 
             if project_key in seen_projects:

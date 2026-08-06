@@ -5,12 +5,13 @@ import sqlite3
 from difflib import SequenceMatcher
 from pathlib import Path
 
+from app.config import DB_PATH
 from app.db import get_connection, init_db, touch_project
 from app.models import ImportItem, ImportResult, ProjectMatch, StoredPdf
 from app.storage import DEFAULT_STORAGE_ROOT, prepare_import_files
 
 
-DEFAULT_DB_PATH = Path("data") / "cqe.db"
+DEFAULT_DB_PATH = DB_PATH
 
 
 def normalize_project_name(name: str) -> str:

@@ -1,6 +1,7 @@
+from app.config import DB_PATH
 from app.db import get_connection
 
-with get_connection("data/cqe.db") as conn:
+with get_connection(DB_PATH) as conn:
     cur = conn.execute(
         """
         INSERT INTO search_filters (name, category, is_active)
