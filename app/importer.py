@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import re
+import shutil
 import sqlite3
+from contextlib import closing
 from difflib import SequenceMatcher
 from pathlib import Path
 
 from app.config import DB_PATH
 from app.db import get_connection, init_db, touch_project
 from app.models import ImportItem, ImportResult, ProjectMatch, StoredPdf
-from app.storage import DEFAULT_STORAGE_ROOT, prepare_import_files
+from app.storage import (
+    DEFAULT_STORAGE_ROOT,
+    ensure_project_storage_dirs,
+    file_sha256,
+    prepare_import_files,
+    safe_name,
+    unique_path,
+)
 
 
 DEFAULT_DB_PATH = DB_PATH
@@ -322,6 +331,100 @@ def create_upload_record(
     )
 
     return int(cur.lastrowid)
+
+
+def import_manual_attachment(
+    item: ImportItem,
+    attachment_file: Path,
+    db_path: Path = DEFAULT_DB_PATH,
+    storage_root: Path = DEFAULT_STORAGE_ROOT,
+) -> ImportResult:
+    """
+    Store a non-PDF manual upload without sending it through PDF indexing.
+
+    Exact duplicates are skipped by the same project + SHA-256 rule used for
+    indexed PDFs. Files with the same name but different contents are retained
+    with a numbered stored filename.
+    """
+    attachment_file = Path(attachment_file)
+
+    if not attachment_file.exists():
+        return ImportResult(
+            status="file_not_found",
+            message=f"Attachment not found: {attachment_file}",
+        )
+
+    init_db(db_path)
+
+    try:
+        file_hash = file_sha256(attachment_file)
+
+        with closing(get_connection(db_path)) as conn, conn:
+            project_id, created_project, match = get_or_create_project(conn, item)
+
+            if upload_exists(conn, project_id, file_hash):
+                return ImportResult(
+                    status="duplicate_file",
+                    message="Attachment already exists; duplicate skipped",
+                    project_id=project_id,
+                    created_project=created_project,
+                    matched_existing_project=match is not None,
+                    skipped_files=[attachment_file.name],
+                )
+
+            dirs = ensure_project_storage_dirs(storage_root, project_id)
+            stored_path = unique_path(
+                dirs["attachments"] / safe_name(attachment_file.name, max_length=180)
+            )
+            shutil.copy2(attachment_file, stored_path)
+
+            suffix = attachment_file.suffix.lower().lstrip(".")
+            cursor = conn.execute(
+                """
+                INSERT INTO uploads (
+                    project_id,
+                    source_system,
+                    original_filename,
+                    stored_filename,
+                    stored_path,
+                    file_type,
+                    file_hash,
+                    page_count,
+                    upload_status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'not_indexed')
+                """,
+                (
+                    project_id,
+                    item.source_system,
+                    attachment_file.name,
+                    stored_path.name,
+                    str(stored_path),
+                    suffix or "file",
+                    file_hash,
+                ),
+            )
+            upload_id = int(cursor.lastrowid)
+            touch_project(conn, project_id)
+
+            return ImportResult(
+                status="imported" if created_project else "updated",
+                message=(
+                    "Created project and saved 1 attachment"
+                    if created_project
+                    else "Updated existing project with 1 attachment"
+                ),
+                project_id=project_id,
+                created_project=created_project,
+                matched_existing_project=match is not None,
+                uploaded_file_ids=[upload_id],
+            )
+    except Exception as exc:
+        return ImportResult(
+            status="error",
+            message=str(exc),
+            errors=[str(exc)],
+        )
 
 
 def import_project_from_source(

@@ -4,6 +4,19 @@
 <h1>{{ project["name"] }}</h1>
 <p class="muted">{{ project["city"] or "" }}{% if project["city"] and project["state"] %}, {% endif %}{{ project["state"] or "" }}</p>
 
+{% set upload_summary_total = upload_summary["pdfs_added"] + upload_summary["attachments_added"] + upload_summary["duplicates_skipped"] + upload_summary["folder_files_ignored"] %}
+{% if upload_summary_total %}
+<div class="alert-success">
+    <strong>Project files processed.</strong>
+    <span>
+        {% if upload_summary["pdfs_added"] %}{{ upload_summary["pdfs_added"] }} searchable PDF{% if upload_summary["pdfs_added"] != 1 %}s{% endif %} added.{% endif %}
+        {% if upload_summary["attachments_added"] %}{{ upload_summary["attachments_added"] }} unindexed attachment{% if upload_summary["attachments_added"] != 1 %}s{% endif %} saved.{% endif %}
+        {% if upload_summary["duplicates_skipped"] %}{{ upload_summary["duplicates_skipped"] }} exact duplicate{% if upload_summary["duplicates_skipped"] != 1 %}s{% endif %} skipped.{% endif %}
+        {% if upload_summary["folder_files_ignored"] %}{{ upload_summary["folder_files_ignored"] }} unsupported folder file{% if upload_summary["folder_files_ignored"] != 1 %}s{% endif %} ignored.{% endif %}
+    </span>
+</div>
+{% endif %}
+
 {% set architect = selected_contacts["Architect"] %}
 {% set general_contractor = selected_contacts["General Contractor"] %}
 
@@ -101,11 +114,12 @@
 </div>
 
 <section class="card">
-    <h2>Uploads</h2>
+    <h2>Project Files</h2>
     <table>
         <thead>
         <tr>
             <th>File</th>
+            <th>Type</th>
             <th>Status</th>
             <th>Pages</th>
             <th>Created</th>
@@ -115,16 +129,27 @@
         {% for upload in uploads %}
         <tr>
             <td>
+                {% if upload["file_type"] == "pdf" %}
                 <a href="{{ url_for('view_upload', upload_id=upload['id']) }}" target="_blank">
                     {{ upload["stored_filename"] }}
                 </a>
+                {% else %}
+                {{ upload["stored_filename"] }}
+                {% endif %}
                 <div class="muted">
                     <a href="{{ url_for('download_upload', upload_id=upload['id']) }}">
                         Download
                     </a>
                 </div>
             </td>
-            <td>{{ upload["upload_status"] }}</td>
+            <td>{{ upload["file_type"]|upper }}</td>
+            <td>
+                {% if upload["upload_status"] == "not_indexed" %}
+                Attachment · not searchable
+                {% else %}
+                {{ upload["upload_status"] }}
+                {% endif %}
+            </td>
             <td>{{ upload["page_count"] or "--" }}</td>
             <td>{{ upload["created_at"] }}</td>
         </tr>

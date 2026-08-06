@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
+import mimetypes
 import os
 import subprocess
 import sys
 import tempfile
 import threading
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 
 from flask import Flask, render_template, abort, send_file, url_for, redirect, request
@@ -14,8 +17,10 @@ from werkzeug.utils import secure_filename
 
 from app import config
 from app.db import get_connection, init_db
-from app.importer import import_project_from_source
+from app.importer import import_manual_attachment, import_project_from_source
 from app.models import ImportItem
+from app.pdf_subset import build_selected_pages_pdf
+from app.project_deletion import delete_projects_and_storage
 
 import re
 
@@ -256,16 +261,20 @@ def load_manual_project_choices():
         ).fetchall()
 
 
-def manual_upload_filename(uploaded_file: FileStorage) -> str:
+def manual_upload_filename(
+    uploaded_file: FileStorage,
+    *,
+    indexed_only: bool = False,
+) -> str:
     filename = secure_filename(uploaded_file.filename or "")
 
     if not filename:
-        raise ValueError("Choose a PDF or ZIP file to upload.")
+        raise ValueError("Choose a valid file to upload.")
 
     suffix = Path(filename).suffix.lower()
 
-    if suffix not in ALLOWED_MANUAL_UPLOAD_EXTENSIONS:
-        raise ValueError("Manual uploads must be a PDF or ZIP file.")
+    if indexed_only and suffix not in ALLOWED_MANUAL_UPLOAD_EXTENSIONS:
+        raise ValueError("Folder uploads only include PDF and ZIP files.")
 
     return filename
 
@@ -584,19 +593,31 @@ def create_app() -> Flask:
 
         if request.method == "POST":
             load_mode = form_data["load_mode"]
-            uploaded_files = [
+            individual_files = [
                 uploaded_file
                 for uploaded_file in request.files.getlist("project_file")
                 if uploaded_file and uploaded_file.filename
             ]
-            validated_uploads: list[tuple[FileStorage, str]] = []
+            folder_files = [
+                uploaded_file
+                for uploaded_file in request.files.getlist("project_folder_file")
+                if uploaded_file and uploaded_file.filename
+            ]
+            validated_uploads: list[tuple[FileStorage, str, bool]] = []
+            try:
+                ignored_folder_files = max(
+                    0,
+                    int(request.form.get("folder_files_ignored_client", "0")),
+                )
+            except ValueError:
+                ignored_folder_files = 0
             item: ImportItem | None = None
 
             if load_mode not in {"new", "existing"}:
                 errors.append("Choose whether to create a new project or attach to an existing project.")
 
-            if not uploaded_files:
-                errors.append("Choose one or more PDF or ZIP files to upload.")
+            if not individual_files and not folder_files:
+                errors.append("Add one or more files or folders to upload.")
 
             if load_mode == "existing":
                 try:
@@ -631,37 +652,79 @@ def create_app() -> Flask:
 
                 item = import_item_for_manual_new_project(request.form)
 
-            for uploaded_file in uploaded_files:
+            for uploaded_file in individual_files:
                 try:
                     filename = manual_upload_filename(uploaded_file)
                 except ValueError as exc:
                     errors.append(str(exc))
                 else:
-                    validated_uploads.append((uploaded_file, filename))
+                    is_indexed_source = (
+                        Path(filename).suffix.lower() in ALLOWED_MANUAL_UPLOAD_EXTENSIONS
+                    )
+                    validated_uploads.append(
+                        (uploaded_file, filename, is_indexed_source)
+                    )
+
+            for uploaded_file in folder_files:
+                try:
+                    filename = manual_upload_filename(
+                        uploaded_file,
+                        indexed_only=True,
+                    )
+                except ValueError:
+                    ignored_folder_files += 1
+                else:
+                    validated_uploads.append((uploaded_file, filename, True))
+
+            if (
+                not errors
+                and (individual_files or folder_files)
+                and not validated_uploads
+            ):
+                errors.append("No PDF or ZIP files were found in the selected folder.")
 
             if not errors and item and validated_uploads:
                 uploaded_file_ids: list[int] = []
+                attachment_file_ids: list[int] = []
+                duplicate_count = 0
                 project_id: int | None = None
 
                 with tempfile.TemporaryDirectory() as temp_dir:
-                    for index, (uploaded_file, filename) in enumerate(validated_uploads):
+                    for index, (
+                        uploaded_file,
+                        filename,
+                        is_indexed_source,
+                    ) in enumerate(validated_uploads):
                         upload_dir = Path(temp_dir) / str(index)
                         upload_dir.mkdir()
                         temp_path = upload_dir / filename
                         uploaded_file.save(temp_path)
 
-                        result = import_project_from_source(
-                            item=item,
-                            matched_file=temp_path,
-                            db_path=DB_PATH,
-                            storage_root=STORAGE_ROOT,
-                        )
+                        if is_indexed_source:
+                            result = import_project_from_source(
+                                item=item,
+                                matched_file=temp_path,
+                                db_path=DB_PATH,
+                                storage_root=STORAGE_ROOT,
+                            )
+                        else:
+                            result = import_manual_attachment(
+                                item=item,
+                                attachment_file=temp_path,
+                                db_path=DB_PATH,
+                                storage_root=STORAGE_ROOT,
+                            )
 
                         if result.project_id:
                             project_id = result.project_id
 
                         if result.uploaded_file_ids:
-                            uploaded_file_ids.extend(result.uploaded_file_ids)
+                            if is_indexed_source:
+                                uploaded_file_ids.extend(result.uploaded_file_ids)
+                            else:
+                                attachment_file_ids.extend(result.uploaded_file_ids)
+
+                        duplicate_count += len(result.skipped_files)
 
                         if not result.ok:
                             errors.append(f"{filename}: {result.message}")
@@ -685,7 +748,16 @@ def create_app() -> Flask:
 
                 if not errors:
                     if project_id:
-                        return redirect(url_for("project_detail", project_id=project_id))
+                        return redirect(
+                            url_for(
+                                "project_detail",
+                                project_id=project_id,
+                                pdfs_added=len(uploaded_file_ids),
+                                attachments_added=len(attachment_file_ids),
+                                duplicates_skipped=duplicate_count,
+                                folder_files_ignored=ignored_folder_files,
+                            )
+                        )
 
                     return redirect(url_for("projects"))
 
@@ -718,53 +790,11 @@ def create_app() -> Flask:
         if not project_ids:
             return redirect(next_url)
 
-        project_ids = list(dict.fromkeys(project_ids))
-        placeholders = ", ".join("?" for _ in project_ids)
-
-        with get_connection(DB_PATH) as conn:
-            existing_rows = conn.execute(
-                f"""
-                SELECT id
-                FROM projects
-                WHERE id IN ({placeholders})
-                """,
-                project_ids,
-            ).fetchall()
-
-            existing_project_ids = [row["id"] for row in existing_rows]
-
-            if existing_project_ids:
-                existing_placeholders = ", ".join("?" for _ in existing_project_ids)
-
-                conn.execute(
-                    f"""
-                    DELETE FROM project_contacts
-                    WHERE project_id IN ({existing_placeholders})
-                    """,
-                    existing_project_ids,
-                )
-                conn.execute(
-                    f"""
-                    DELETE FROM search_results
-                    WHERE project_id IN ({existing_placeholders})
-                    """,
-                    existing_project_ids,
-                )
-                conn.execute(
-                    f"""
-                    DELETE FROM uploads
-                    WHERE project_id IN ({existing_placeholders})
-                    """,
-                    existing_project_ids,
-                )
-                conn.execute(
-                    f"""
-                    DELETE FROM projects
-                    WHERE id IN ({existing_placeholders})
-                    """,
-                    existing_project_ids,
-                )
-                conn.commit()
+        delete_projects_and_storage(
+            project_ids=project_ids,
+            db_path=DB_PATH,
+            storage_root=STORAGE_ROOT,
+        )
 
         return redirect(next_url)
 
@@ -823,6 +853,19 @@ def create_app() -> Flask:
                 (project_id,),
             ).fetchall()
 
+        upload_summary: dict[str, int] = {}
+        for key in (
+            "pdfs_added",
+            "attachments_added",
+            "duplicates_skipped",
+            "folder_files_ignored",
+        ):
+            try:
+                value = max(0, int(request.args.get(key, "0")))
+            except ValueError:
+                value = 0
+            upload_summary[key] = value
+
         return render_template(
             "project_detail.html",
             project=project,
@@ -830,6 +873,7 @@ def create_app() -> Flask:
             selected_contacts=best_project_contacts(contacts),
             matches=matches,
             statuses=PROJECT_STATUSES,
+            upload_summary=upload_summary,
         )
     
     @app.route("/projects/<int:project_id>/contacts/<contact_type_key>", methods=["POST"])
@@ -989,7 +1033,7 @@ def create_app() -> Flask:
         with get_connection(DB_PATH) as conn:
             upload = conn.execute(
                 """
-                SELECT id, stored_path, stored_filename
+                SELECT id, stored_path, stored_filename, file_type
                 FROM uploads
                 WHERE id = ?
                 """,
@@ -997,6 +1041,9 @@ def create_app() -> Flask:
             ).fetchone()
 
         if not upload:
+            abort(404)
+
+        if upload["file_type"].lower() != "pdf":
             abort(404)
 
         file_path = stored_file_path(upload["stored_path"])
@@ -1032,11 +1079,62 @@ def create_app() -> Flask:
         if not file_path.exists():
             abort(404)
 
+        mimetype, _ = mimetypes.guess_type(upload["stored_filename"])
+
         return send_file(
             file_path,
-            mimetype="application/pdf",
+            mimetype=mimetype or "application/octet-stream",
             as_attachment=True,
             download_name=upload["stored_filename"],
+        )
+
+
+    @app.route("/uploads/download-selected-pages", methods=["POST"])
+    def download_selected_pages():
+        raw_selections = request.form.get("selections", "")
+
+        try:
+            selection_items = json.loads(raw_selections)
+        except json.JSONDecodeError:
+            abort(400, "Selected pages are invalid.")
+
+        if not isinstance(selection_items, list):
+            abort(400, "Selected pages are invalid.")
+
+        selections: list[tuple[int, int]] = []
+        for item in selection_items:
+            if not isinstance(item, dict):
+                abort(400, "Selected pages are invalid.")
+
+            selections.append(
+                (
+                    item.get("upload_id"),
+                    item.get("page_number"),
+                )
+            )
+
+        try:
+            pdf_bytes = build_selected_pages_pdf(
+                selections=selections,
+                db_path=DB_PATH,
+            )
+        except FileNotFoundError as exc:
+            abort(404, str(exc))
+        except ValueError as exc:
+            abort(400, str(exc))
+
+        term = secure_filename(request.form.get("term", "").strip())[:80]
+        download_name = (
+            f"{term}-selected-pages.pdf"
+            if term
+            else "selected-pages.pdf"
+        )
+
+        return send_file(
+            BytesIO(pdf_bytes),
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=download_name,
         )
 
 

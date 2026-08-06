@@ -74,6 +74,7 @@ def ensure_project_storage_dirs(
         "base": base,
         "originals": base / "originals",
         "documents": base / "documents",
+        "attachments": base / "attachments",
         "extracted": base / "extracted",
     }
 

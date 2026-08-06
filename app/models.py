@@ -29,6 +29,7 @@ UploadStatus = Literal[
     "pending_index",
     "indexed",
     "index_error",
+    "not_indexed",
 ]
 
 

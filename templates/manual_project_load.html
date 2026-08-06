@@ -24,7 +24,7 @@
 {% endif %}
 
 <div class="card form-card">
-    <form method="post" action="{{ url_for('manual_project_load') }}" enctype="multipart/form-data">
+    <form id="manual-project-form" method="post" action="{{ url_for('manual_project_load') }}" enctype="multipart/form-data">
         <div class="form-group">
             <label for="load-mode">Load Option</label>
             <select id="load-mode" name="load_mode">
@@ -122,15 +122,43 @@
         </div>
 
         <div class="form-group">
-            <label for="project-file">Project Files</label>
-            <input id="project-file" name="project_file" type="file" accept=".pdf,.zip" multiple required>
-            <div class="help-text">
-                Upload one or more PDFs or ZIP files. Use Ctrl or Shift to select multiple files from the same folder. New uploads are indexed immediately; contact extraction runs when both Architect and General Contractor are blank.
+            <label>Project Files</label>
+            <input id="project-file" class="visually-hidden" name="project_file" type="file" multiple tabindex="-1" aria-hidden="true">
+            <input id="project-folder" class="visually-hidden" name="project_folder_file" type="file" accept=".pdf,.zip" webkitdirectory directory multiple tabindex="-1" aria-hidden="true">
+            <input id="folder-files-ignored" name="folder_files_ignored_client" type="hidden" value="0">
+
+            <div id="upload-drop-zone" class="upload-drop-zone" role="button" tabindex="0" aria-describedby="upload-help">
+                <div class="upload-drop-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" width="32" height="32">
+                        <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <div class="upload-drop-copy">
+                    <strong>Drop files or folders here</strong>
+                    <span>Add from as many locations as needed</span>
+                </div>
+                <div class="upload-picker-actions">
+                    <button id="add-files-button" type="button" class="button-secondary">Add Files</button>
+                    <button id="add-folder-button" type="button" class="button-secondary">Add Folder</button>
+                </div>
+            </div>
+
+            <div id="upload-help" class="help-text">
+                PDFs and PDFs inside ZIPs are indexed and searchable. Individual non-PDF files are saved as downloadable attachments but are not searchable. Folder uploads include PDF and ZIP files only.
+            </div>
+            <div id="upload-notice" class="upload-notice" aria-live="polite" hidden></div>
+
+            <div class="upload-queue-header">
+                <strong>Files ready to load</strong>
+                <span id="upload-count" class="muted">0 files</span>
+            </div>
+            <div id="upload-queue" class="upload-queue">
+                <div class="upload-queue-empty">No files added yet.</div>
             </div>
         </div>
 
         <div class="form-actions">
-            <button type="submit" class="button-primary">Load Project</button>
+            <button id="load-project-button" type="submit" class="button-primary" disabled>Load Project</button>
             <a class="button-secondary" href="{{ url_for('projects') }}">Cancel</a>
         </div>
     </form>
@@ -143,6 +171,21 @@
     const projectName = document.getElementById("project-name");
     const state = document.getElementById("state");
     const existingProjectId = document.getElementById("existing-project-id");
+    const manualProjectForm = document.getElementById("manual-project-form");
+    const projectFileInput = document.getElementById("project-file");
+    const projectFolderInput = document.getElementById("project-folder");
+    const ignoredFolderInput = document.getElementById("folder-files-ignored");
+    const dropZone = document.getElementById("upload-drop-zone");
+    const addFilesButton = document.getElementById("add-files-button");
+    const addFolderButton = document.getElementById("add-folder-button");
+    const uploadQueue = document.getElementById("upload-queue");
+    const uploadCount = document.getElementById("upload-count");
+    const uploadNotice = document.getElementById("upload-notice");
+    const loadProjectButton = document.getElementById("load-project-button");
+    const indexedExtensions = new Set(["pdf", "zip"]);
+    let queuedFiles = [];
+    let nextQueueId = 1;
+    let ignoredFolderFiles = 0;
 
     function syncManualLoadForm() {
         const attachingToExisting = loadMode.value === "existing";
@@ -157,5 +200,259 @@
 
     loadMode.addEventListener("change", syncManualLoadForm);
     syncManualLoadForm();
+
+    function fileExtension(filename) {
+        const lastDot = filename.lastIndexOf(".");
+        return lastDot === -1 ? "" : filename.slice(lastDot + 1).toLowerCase();
+    }
+
+    function isIndexedSource(file) {
+        return indexedExtensions.has(fileExtension(file.name));
+    }
+
+    function fileKey(file) {
+        return [file.name.toLowerCase(), file.size, file.lastModified].join("::");
+    }
+
+    function formatFileSize(bytes) {
+        if (bytes < 1024) {
+            return `${bytes} B`;
+        }
+        if (bytes < 1024 * 1024) {
+            return `${(bytes / 1024).toFixed(1)} KB`;
+        }
+        return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    }
+
+    function setNotice(message, tone = "info") {
+        uploadNotice.textContent = message;
+        uploadNotice.dataset.tone = tone;
+        uploadNotice.hidden = !message;
+    }
+
+    function addFiles(files, source) {
+        let added = 0;
+        let duplicates = 0;
+        let ignored = 0;
+        const existingKeys = new Set(queuedFiles.map((entry) => fileKey(entry.file)));
+
+        for (const file of files) {
+            if (source === "folder" && !isIndexedSource(file)) {
+                ignored += 1;
+                ignoredFolderFiles += 1;
+                continue;
+            }
+
+            const key = fileKey(file);
+            if (existingKeys.has(key)) {
+                duplicates += 1;
+                continue;
+            }
+
+            queuedFiles.push({
+                id: nextQueueId++,
+                file,
+                source,
+            });
+            existingKeys.add(key);
+            added += 1;
+        }
+
+        if (ignored) {
+            setNotice(
+                `${ignored} unsupported folder ${ignored === 1 ? "file was" : "files were"} ignored. Folder uploads include PDFs and ZIPs only.`,
+                "warning",
+            );
+        } else if (duplicates) {
+            setNotice(
+                `${duplicates} duplicate ${duplicates === 1 ? "selection was" : "selections were"} skipped.`,
+            );
+        } else if (added) {
+            setNotice("");
+        }
+
+        renderQueue();
+    }
+
+    function renderQueue() {
+        uploadQueue.replaceChildren();
+
+        if (!queuedFiles.length) {
+            const emptyState = document.createElement("div");
+            emptyState.className = "upload-queue-empty";
+            emptyState.textContent = "No files added yet.";
+            uploadQueue.appendChild(emptyState);
+        }
+
+        for (const entry of queuedFiles) {
+            const row = document.createElement("div");
+            row.className = "upload-queue-item";
+
+            const details = document.createElement("div");
+            details.className = "upload-file-details";
+
+            const name = document.createElement("strong");
+            name.textContent = entry.file.name;
+
+            const metadata = document.createElement("span");
+            const typeLabel = isIndexedSource(entry.file)
+                ? "Searchable document"
+                : "Attachment · not searchable";
+            metadata.textContent = `${formatFileSize(entry.file.size)} · ${typeLabel}`;
+
+            details.append(name, metadata);
+
+            const removeButton = document.createElement("button");
+            removeButton.type = "button";
+            removeButton.className = "upload-remove-button";
+            removeButton.setAttribute("aria-label", `Remove ${entry.file.name}`);
+            removeButton.textContent = "Remove";
+            removeButton.addEventListener("click", () => {
+                queuedFiles = queuedFiles.filter((item) => item.id !== entry.id);
+                renderQueue();
+            });
+
+            row.append(details, removeButton);
+            uploadQueue.appendChild(row);
+        }
+
+        uploadCount.textContent = `${queuedFiles.length} ${queuedFiles.length === 1 ? "file" : "files"}`;
+        loadProjectButton.disabled = queuedFiles.length === 0;
+        ignoredFolderInput.value = String(ignoredFolderFiles);
+    }
+
+    function syncNativeInputs() {
+        const individualTransfer = new DataTransfer();
+        const folderTransfer = new DataTransfer();
+
+        for (const entry of queuedFiles) {
+            const transfer = entry.source === "folder"
+                ? folderTransfer
+                : individualTransfer;
+            transfer.items.add(entry.file);
+        }
+
+        projectFileInput.files = individualTransfer.files;
+        projectFolderInput.files = folderTransfer.files;
+    }
+
+    function readDirectoryEntries(reader) {
+        return new Promise((resolve, reject) => {
+            const entries = [];
+
+            function readBatch() {
+                reader.readEntries((batch) => {
+                    if (!batch.length) {
+                        resolve(entries);
+                        return;
+                    }
+                    entries.push(...batch);
+                    readBatch();
+                }, reject);
+            }
+
+            readBatch();
+        });
+    }
+
+    function entryFile(entry) {
+        return new Promise((resolve, reject) => entry.file(resolve, reject));
+    }
+
+    async function filesFromEntry(entry) {
+        if (entry.isFile) {
+            return [await entryFile(entry)];
+        }
+
+        if (!entry.isDirectory) {
+            return [];
+        }
+
+        const children = await readDirectoryEntries(entry.createReader());
+        const nestedFiles = await Promise.all(children.map(filesFromEntry));
+        return nestedFiles.flat();
+    }
+
+    projectFileInput.addEventListener("change", () => {
+        addFiles(Array.from(projectFileInput.files), "individual");
+        projectFileInput.value = "";
+    });
+
+    projectFolderInput.addEventListener("change", () => {
+        addFiles(Array.from(projectFolderInput.files), "folder");
+        projectFolderInput.value = "";
+    });
+
+    addFilesButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        projectFileInput.click();
+    });
+
+    addFolderButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        projectFolderInput.click();
+    });
+
+    dropZone.addEventListener("click", (event) => {
+        if (!event.target.closest("button")) {
+            projectFileInput.click();
+        }
+    });
+
+    dropZone.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            projectFileInput.click();
+        }
+    });
+
+    for (const eventName of ["dragenter", "dragover"]) {
+        dropZone.addEventListener(eventName, (event) => {
+            event.preventDefault();
+            dropZone.classList.add("is-dragging");
+        });
+    }
+
+    for (const eventName of ["dragleave", "drop"]) {
+        dropZone.addEventListener(eventName, (event) => {
+            event.preventDefault();
+            dropZone.classList.remove("is-dragging");
+        });
+    }
+
+    dropZone.addEventListener("drop", async (event) => {
+        const items = Array.from(event.dataTransfer.items || []);
+        const entries = items
+            .map((item) => item.webkitGetAsEntry ? item.webkitGetAsEntry() : null)
+            .filter(Boolean);
+
+        if (!entries.length) {
+            addFiles(Array.from(event.dataTransfer.files), "individual");
+            return;
+        }
+
+        try {
+            for (const entry of entries) {
+                const files = await filesFromEntry(entry);
+                addFiles(files, entry.isDirectory ? "folder" : "individual");
+            }
+        } catch (error) {
+            setNotice("One or more dropped items could not be read. Try Add Files or Add Folder instead.", "warning");
+        }
+    });
+
+    manualProjectForm.addEventListener("submit", (event) => {
+        if (!queuedFiles.length) {
+            event.preventDefault();
+            setNotice("Add at least one file before loading the project.", "warning");
+            return;
+        }
+
+        syncNativeInputs();
+        loadProjectButton.disabled = true;
+        loadProjectButton.textContent = "Loading…";
+    });
+
+    renderQueue();
 </script>
 {% endblock %}

@@ -24,6 +24,14 @@
 </div>
 
 <div class="card">
+    <form id="search-result-delete-form" method="post" action="{{ url_for('delete_projects') }}">
+    <input type="hidden" name="next" value="{{ request.full_path }}">
+    <div class="table-toolbar">
+        <button id="delete-search-results-button" class="button-danger" type="submit" disabled>
+            Delete Selected
+        </button>
+        <span id="search-results-selected-count" class="muted" hidden></span>
+    </div>
     <div class="table-scroll">
     <table class="search-results-table">
         <thead>
@@ -46,6 +54,9 @@
             <th>Pages</th>
             <th>Status</th>
             <th>Category</th>
+            <th class="select-cell">
+                <input id="select-all-search-results" type="checkbox" aria-label="Select all projects for deletion">
+            </th>
         </tr>
         </thead>
         <tbody>
@@ -101,11 +112,20 @@
             <td>
                 <div class="match-summary">{{ row["category"] }}</div>
             </td>
+            <td class="select-cell">
+                <input
+                    type="checkbox"
+                    name="project_ids"
+                    value="{{ row['project_id'] }}"
+                    aria-label="Select {{ row['project_name'] }} for deletion"
+                >
+            </td>
         </tr>
         {% endfor %}
         </tbody>
     </table>
     </div>
+    </form>
 </div>
 
 <style>
@@ -144,6 +164,13 @@
 <script>
     const searchResultsTable = document.querySelector(".search-results-table");
     const sortButtons = Array.from(searchResultsTable.querySelectorAll("[data-sort-column]"));
+    const deleteSearchResultsForm = document.getElementById("search-result-delete-form");
+    const deleteSearchResultsButton = document.getElementById("delete-search-results-button");
+    const searchResultsSelectedCount = document.getElementById("search-results-selected-count");
+    const selectAllSearchResults = document.getElementById("select-all-search-results");
+    const searchResultCheckboxes = Array.from(
+        deleteSearchResultsForm.querySelectorAll("input[name='project_ids']")
+    );
 
     function parseSortDate(value) {
         if (!value) {
@@ -201,5 +228,49 @@
             sortSearchResults(columnIndex, nextDirection);
         });
     });
+
+    function updateSearchResultDeleteControls() {
+        const checkedCount = searchResultCheckboxes.filter((checkbox) => checkbox.checked).length;
+
+        deleteSearchResultsButton.disabled = checkedCount === 0;
+        searchResultsSelectedCount.hidden = checkedCount === 0;
+        searchResultsSelectedCount.textContent = checkedCount === 1
+            ? "1 project selected"
+            : `${checkedCount} projects selected`;
+
+        selectAllSearchResults.checked = (
+            searchResultCheckboxes.length > 0
+            && checkedCount === searchResultCheckboxes.length
+        );
+        selectAllSearchResults.indeterminate = (
+            checkedCount > 0
+            && checkedCount < searchResultCheckboxes.length
+        );
+        selectAllSearchResults.disabled = searchResultCheckboxes.length === 0;
+    }
+
+    searchResultCheckboxes.forEach((checkbox) => {
+        checkbox.addEventListener("change", updateSearchResultDeleteControls);
+    });
+
+    selectAllSearchResults.addEventListener("change", () => {
+        searchResultCheckboxes.forEach((checkbox) => {
+            checkbox.checked = selectAllSearchResults.checked;
+        });
+        updateSearchResultDeleteControls();
+    });
+
+    deleteSearchResultsForm.addEventListener("submit", (event) => {
+        const checkedCount = searchResultCheckboxes.filter((checkbox) => checkbox.checked).length;
+        const projectText = checkedCount === 1 ? "project" : "projects";
+
+        if (!window.confirm(
+            `Permanently delete ${checkedCount} selected ${projectText} and their stored files? This cannot be undone.`
+        )) {
+            event.preventDefault();
+        }
+    });
+
+    updateSearchResultDeleteControls();
 </script>
 {% endblock %}

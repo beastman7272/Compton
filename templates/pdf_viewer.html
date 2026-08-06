@@ -36,6 +36,35 @@
     data-documents='{{ documents|tojson }}'
     data-search-term="{{ term or '' }}"
 >
+    <form
+        id="page-selection-form"
+        class="card page-selection-toolbar"
+        method="post"
+        action="{{ url_for('download_selected_pages') }}"
+    >
+        <input id="selected-pages-value" type="hidden" name="selections" value="[]">
+        <input type="hidden" name="term" value="{{ term or '' }}">
+
+        <div class="page-selection-summary">
+            <strong>Download matching pages</strong>
+            <span id="selected-pages-count" class="muted" aria-live="polite">
+                Loading matching pages…
+            </span>
+        </div>
+
+        <div class="page-selection-actions">
+            <button id="select-all-pages" type="button" class="button-secondary" disabled>
+                Select All
+            </button>
+            <button id="clear-selected-pages" type="button" class="button-secondary" disabled>
+                Clear
+            </button>
+            <button id="download-selected-pages" type="submit" class="button-primary" disabled>
+                Download Selected Pages
+            </button>
+        </div>
+    </form>
+
     <section class="card pdf-card">
         <div id="pdf-pages" class="pdf-pages"></div>
     </section>
@@ -79,6 +108,13 @@
         ])
     );
     const searchTerm = viewer.dataset.searchTerm;
+    const pageSelectionForm = document.getElementById("page-selection-form");
+    const selectedPagesValue = document.getElementById("selected-pages-value");
+    const selectedPagesCount = document.getElementById("selected-pages-count");
+    const selectAllPagesButton = document.getElementById("select-all-pages");
+    const clearSelectedPagesButton = document.getElementById("clear-selected-pages");
+    const downloadSelectedPagesButton = document.getElementById("download-selected-pages");
+    let pageSelectionReady = false;
 
     function escapeRegExp(value) {
         return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -103,49 +139,133 @@
     }
     */
 
-    function highlightTextLayer(container, term) {
-        if (!term) return;
+    function isFlexibleTermSeparator(character) {
+        return /[\s\u00ad\u002d\u058a\u05be\u1400\u1806\u2010-\u2015\u2212\ufe58\ufe63\uff0d]/u.test(character);
+    }
 
-        const regex = new RegExp(escapeRegExp(term), "gi");
+    function canonicalHighlightText(value) {
+        let canonical = "";
+
+        for (const character of value || "") {
+            if (!isFlexibleTermSeparator(character)) {
+                canonical += character.toLocaleLowerCase();
+            }
+        }
+
+        return canonical;
+    }
+
+    function mergeHighlightRanges(ranges) {
+        const sortedRanges = ranges.sort((left, right) => left.start - right.start);
+        const mergedRanges = [];
+
+        for (const range of sortedRanges) {
+            const previous = mergedRanges[mergedRanges.length - 1];
+
+            if (previous && range.start <= previous.end) {
+                previous.end = Math.max(previous.end, range.end);
+            } else {
+                mergedRanges.push({ ...range });
+            }
+        }
+
+        return mergedRanges;
+    }
+
+    function applyHighlightRanges(node, ranges) {
+        const fragment = document.createDocumentFragment();
+        const text = node.nodeValue;
+        let cursor = 0;
+
+        for (const range of mergeHighlightRanges(ranges)) {
+            fragment.appendChild(
+                document.createTextNode(text.slice(cursor, range.start))
+            );
+
+            const mark = document.createElement("mark");
+            mark.className = "pdf-highlight";
+            mark.textContent = text.slice(range.start, range.end);
+            fragment.appendChild(mark);
+            cursor = range.end;
+        }
+
+        fragment.appendChild(document.createTextNode(text.slice(cursor)));
+        node.replaceWith(fragment);
+    }
+
+    function highlightTextLayer(container, term) {
+        const canonicalTerm = canonicalHighlightText(term);
+        if (!canonicalTerm) return 0;
+
         const walker = document.createTreeWalker(
             container,
             NodeFilter.SHOW_TEXT,
-            {
-                acceptNode(node) {
-                    regex.lastIndex = 0;
-                    return regex.test(node.nodeValue)
-                        ? NodeFilter.FILTER_ACCEPT
-                        : NodeFilter.FILTER_REJECT;
+        );
+        const canonicalPositions = [];
+        let canonicalPageText = "";
+        while (walker.nextNode()) {
+            const node = walker.currentNode;
+
+            for (let offset = 0; offset < node.nodeValue.length; offset += 1) {
+                const character = node.nodeValue[offset];
+
+                if (isFlexibleTermSeparator(character)) {
+                    continue;
+                }
+
+                const canonicalCharacter = character.toLocaleLowerCase();
+                canonicalPageText += canonicalCharacter;
+
+                for (let index = 0; index < canonicalCharacter.length; index += 1) {
+                    canonicalPositions.push({ node, offset });
                 }
             }
-        );
-        const nodes = [];
-
-        while (walker.nextNode()) {
-            nodes.push(walker.currentNode);
         }
 
-        for (const node of nodes) {
-            const fragment = document.createDocumentFragment();
-            let lastIndex = 0;
+        const rangesByNode = new Map();
+        let matchCount = 0;
+        let searchFrom = 0;
 
-            node.nodeValue.replace(regex, (match, offset) => {
-                fragment.appendChild(
-                    document.createTextNode(node.nodeValue.slice(lastIndex, offset))
-                );
+        while (searchFrom <= canonicalPageText.length - canonicalTerm.length) {
+            const matchStart = canonicalPageText.indexOf(canonicalTerm, searchFrom);
 
-                const mark = document.createElement("mark");
-                mark.className = "pdf-highlight";
-                mark.textContent = match;
-                fragment.appendChild(mark);
+            if (matchStart === -1) {
+                break;
+            }
 
-                lastIndex = offset + match.length;
-                return match;
-            });
+            const matchEnd = matchStart + canonicalTerm.length;
+            const matchRangesByNode = new Map();
 
-            fragment.appendChild(document.createTextNode(node.nodeValue.slice(lastIndex)));
-            node.replaceWith(fragment);
+            for (let index = matchStart; index < matchEnd; index += 1) {
+                const position = canonicalPositions[index];
+                const existingRange = matchRangesByNode.get(position.node);
+
+                if (existingRange) {
+                    existingRange.start = Math.min(existingRange.start, position.offset);
+                    existingRange.end = Math.max(existingRange.end, position.offset + 1);
+                } else {
+                    matchRangesByNode.set(position.node, {
+                        start: position.offset,
+                        end: position.offset + 1
+                    });
+                }
+            }
+
+            for (const [node, range] of matchRangesByNode) {
+                const nodeRanges = rangesByNode.get(node) || [];
+                nodeRanges.push(range);
+                rangesByNode.set(node, nodeRanges);
+            }
+
+            matchCount += 1;
+            searchFrom = matchEnd;
         }
+
+        for (const [node, ranges] of rangesByNode) {
+            applyHighlightRanges(node, ranges);
+        }
+
+        return matchCount;
     }
 
     async function renderTextLayer(page, viewport, container) {
@@ -174,7 +294,43 @@
         await renderTask.promise;
     }
 
-    async function renderPdfPage(pdf, targetPageNumber, pagesContainer, storedFilename) {
+    function pageSelectionInputs() {
+        return Array.from(
+            document.querySelectorAll(".pdf-page-selection")
+        );
+    }
+
+    function updatePageSelectionControls() {
+        const pageInputs = pageSelectionInputs();
+        const selectedCount = pageInputs.filter((input) => input.checked).length;
+
+        if (!pageSelectionReady) {
+            selectedPagesCount.textContent = "Loading matching pages…";
+            return;
+        }
+
+        selectedPagesCount.textContent = selectedCount === 1
+            ? "1 page selected"
+            : `${selectedCount} pages selected`;
+        selectAllPagesButton.disabled = selectedCount === pageInputs.length;
+        clearSelectedPagesButton.disabled = selectedCount === 0;
+        downloadSelectedPagesButton.disabled = selectedCount === 0;
+    }
+
+    function setAllPageSelections(checked) {
+        for (const input of pageSelectionInputs()) {
+            input.checked = checked;
+        }
+        updatePageSelectionControls();
+    }
+
+    async function renderPdfPage(
+        pdf,
+        targetPageNumber,
+        pagesContainer,
+        uploadId,
+        storedFilename
+    ) {
         const page = await pdf.getPage(targetPageNumber);
 
         const pageWrapper = document.createElement("div");
@@ -182,9 +338,29 @@
 
         const pageLabel = document.createElement("div");
         pageLabel.className = "pdf-page-label";
-        pageLabel.textContent = storedFilename
+
+        const pageTitle = document.createElement("span");
+        pageTitle.textContent = storedFilename
             ? `${storedFilename} - Page ${targetPageNumber}`
             : `Page ${targetPageNumber}`;
+
+        const selectionLabel = document.createElement("label");
+        selectionLabel.className = "pdf-page-selection-label";
+
+        const selectionInput = document.createElement("input");
+        selectionInput.type = "checkbox";
+        selectionInput.className = "pdf-page-selection";
+        selectionInput.checked = true;
+        selectionInput.disabled = true;
+        selectionInput.dataset.uploadId = String(uploadId);
+        selectionInput.dataset.pageNumber = String(targetPageNumber);
+        selectionInput.addEventListener("change", updatePageSelectionControls);
+
+        const selectionText = document.createElement("span");
+        selectionText.textContent = "Include in download";
+
+        selectionLabel.append(selectionInput, selectionText);
+        pageLabel.append(pageTitle, selectionLabel);
 
         const pageContainer = document.createElement("div");
         pageContainer.className = "pdf-page";
@@ -226,6 +402,7 @@
         for (const documentInfo of documents) {
             const loadingTask = pdfjsLib.getDocument(documentInfo.pdf_url);
             const pdf = await loadingTask.promise;
+            const uploadId = Number(documentInfo.upload?.id);
             const storedFilename = documentInfo.upload?.stored_filename || "";
 
             for (const targetPageNumber of documentInfo.page_numbers) {
@@ -233,13 +410,53 @@
                     pdf,
                     targetPageNumber,
                     pagesContainer,
+                    uploadId,
                     storedFilename
                 );
             }
         }
+
+        pageSelectionReady = true;
+        for (const input of pageSelectionInputs()) {
+            input.disabled = false;
+        }
+        updatePageSelectionControls();
     }
 
+    selectAllPagesButton.addEventListener("click", () => {
+        setAllPageSelections(true);
+    });
+
+    clearSelectedPagesButton.addEventListener("click", () => {
+        setAllPageSelections(false);
+    });
+
+    pageSelectionForm.addEventListener("submit", (event) => {
+        const selections = pageSelectionInputs()
+            .filter((input) => input.checked)
+            .map((input) => ({
+                upload_id: Number(input.dataset.uploadId),
+                page_number: Number(input.dataset.pageNumber)
+            }));
+
+        if (!selections.length) {
+            event.preventDefault();
+            return;
+        }
+
+        selectedPagesValue.value = JSON.stringify(selections);
+        downloadSelectedPagesButton.disabled = true;
+        downloadSelectedPagesButton.textContent = "Preparing Download…";
+        window.setTimeout(() => {
+            downloadSelectedPagesButton.textContent = "Download Selected Pages";
+            updatePageSelectionControls();
+        }, 1500);
+    });
+
     // highlightContextPanel();
-    renderPdfPages();
+    renderPdfPages().catch((error) => {
+        selectedPagesCount.textContent = "Matching pages could not be loaded.";
+        console.error(error);
+    });
 </script>
 {% endblock %}

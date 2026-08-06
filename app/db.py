@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -31,7 +32,7 @@ def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
     """
     Create all V1 database tables if they do not already exist.
     """
-    with get_connection(db_path) as conn:
+    with closing(get_connection(db_path)) as conn, conn:
         create_tables(conn)
         create_indexes(conn)
 
