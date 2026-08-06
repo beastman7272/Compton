@@ -19,6 +19,8 @@ playwright_bc_profile_chrome.zip
 
 #Ignore SQLite db
 data/cqe.db
+*.db-shm
+*.db-wal
 
 #Ignore tokens
 token.pickle
