@@ -37,6 +37,7 @@ EXPORT_CLEANUP_POLL_MS = 3000
 MENU_CLICK_TIMEOUT_MS = 90000
 DOWNLOAD_TIMEOUT_MS = 180000
 EXPORT_WAIT_TIMEOUT_MS = 180000
+NAV_TIMEOUT_MS = 60_000
 
 MANUFACTURER_DAYS = {
     "Citadel": {"monday"},
@@ -286,7 +287,7 @@ def attempt_constructconnect_login(page: Page) -> None:
         password_input.press("Enter")
 
     page.wait_for_timeout(5000)
-    page.goto(SEARCH_URL, wait_until="domcontentloaded")
+    page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     page.wait_for_timeout(3000)
 
     if not has_search_ui(page):
@@ -295,7 +296,7 @@ def attempt_constructconnect_login(page: Page) -> None:
 
 def ensure_constructconnect_login(page: Page, *, non_interactive: bool = False) -> None:
     log("Opening ConstructConnect search page")
-    page.goto(SEARCH_URL, wait_until="domcontentloaded")
+    page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     page.wait_for_timeout(2500)
 
     if has_search_ui(page):
@@ -319,7 +320,7 @@ def ensure_constructconnect_login(page: Page, *, non_interactive: bool = False) 
     input()
     page.wait_for_timeout(1500)
 
-    page.goto(SEARCH_URL, wait_until="domcontentloaded")
+    page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     page.wait_for_timeout(2500)
     if not has_search_ui(page):
         raise ConstructConnectLoginRequired(LOGIN_REQUIRED_MESSAGE)
@@ -327,7 +328,7 @@ def ensure_constructconnect_login(page: Page, *, non_interactive: bool = False) 
 
 def open_search(page: Page) -> None:
     log("Opening search page")
-    page.goto(SEARCH_URL, wait_until="domcontentloaded")
+    page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     page.wait_for_timeout(2500)
     try:
         wait_visible(page, "#demo-input-local")
@@ -969,11 +970,13 @@ def try_update_sheet_status(sheets_service, project: Project, value: str) -> boo
 
 
 def launch_context(pw, *, headless: bool):
-    return pw.chromium.launch_persistent_context(
+    context = pw.chromium.launch_persistent_context(
         user_data_dir=str(PROFILE_DIR),
         headless=headless,
         accept_downloads=True,
     )
+    context.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+    return context
 
 
 def check_login(*, headless: bool) -> bool:
