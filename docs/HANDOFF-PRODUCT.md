@@ -46,10 +46,12 @@ Driven by `--run-day` (weekday name), **not** a fixed Railway env var:
 | Day | Manufacturer |
 |-----|--------------|
 | Monday | Citadel |
-| Tuesday, Sunday | Fortress |
-| Wednesday, Saturday | Fabral |
+| Tuesday | Fortress |
+| Wednesday | Fabral |
 | Thursday | Metal-Era |
 | Friday | none |
+| Saturday | Roof Schedule |
+| Sunday | Fortress Alt Words SE |
 
 ---
 

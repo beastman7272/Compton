@@ -56,9 +56,11 @@ CC_IMPORT_STATUS_COL = "M"         # CQE/import status
 
 MANUFACTURER_DAYS = {
     "Citadel": {"monday"},
-    "Fortress": {"tuesday", "sunday"},
-    "Fabral": {"wednesday", "saturday"},
+    "Fortress": {"tuesday"},
+    "Fabral": {"wednesday"},
     "Metal-Era": {"thursday"},
+    "Roof Schedule": {"saturday"},
+    "Fortress Alt Words SE": {"sunday"},
 }
 WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 

@@ -40,9 +40,11 @@ EXPORT_WAIT_TIMEOUT_MS = 180000
 
 MANUFACTURER_DAYS = {
     "Citadel": {"monday"},
-    "Fortress": {"tuesday", "sunday"},
-    "Fabral": {"wednesday", "saturday"},
+    "Fortress": {"tuesday"},
+    "Fabral": {"wednesday"},
     "Metal-Era": {"thursday"},
+    "Roof Schedule": {"saturday"},
+    "Fortress Alt Words SE": {"sunday"},
 }
 WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
