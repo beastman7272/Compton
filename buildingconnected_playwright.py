@@ -1228,13 +1228,36 @@ def visible_file_items(page: Page) -> list[dict[str, str]]:
         """
         () => {
           const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-          const nodes = [...document.querySelectorAll(
+          const visible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return (
+              rect.width > 0 &&
+              rect.height > 0 &&
+              rect.bottom >= 0 &&
+              rect.top <= window.innerHeight &&
+              rect.right >= 0 &&
+              rect.left <= window.innerWidth &&
+              style.display !== 'none' &&
+              style.visibility !== 'hidden'
+            );
+          };
+          const fileGrid = [...document.querySelectorAll('[role=grid][aria-label=grid]')]
+            .find((grid) =>
+              visible(grid) &&
+              grid.querySelector('[data-id=file-name-link], [data-id=file-checkbox]')
+            );
+          if (!fileGrid) return [];
+
+          const nodes = [...fileGrid.querySelectorAll(
             '[role=row], tr, a, button, [title], [aria-label], [class*=file], [class*=File], [class*=folder], [class*=Folder]'
           )];
           const seen = new Set();
           const out = [];
 
           for (const el of nodes) {
+            if (!visible(el)) continue;
             if (el.closest('[data-id="file-list-tools"]')) continue;
             const text = clean(el.innerText || el.textContent || '');
             const title = clean(el.getAttribute('title'));
@@ -1290,6 +1313,155 @@ def print_visible_file_items(page: Page) -> None:
         parts = [item["text"], item["title"], item["aria"]]
         label = " | ".join(part for part in parts if part)
         print(f"  {idx:02d}. [{item['tag']}{' role=' + item['role'] if item['role'] else ''}] {label[:240]}")
+
+
+def print_files_dom_diagnostics(page: Page) -> None:
+    """Print read-only DOM evidence for Files-tab selector investigation."""
+    payload = page.evaluate(
+        """
+        () => {
+          const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+          const className = (el) => clean(
+            typeof el?.className === 'string'
+              ? el.className
+              : el?.className?.baseVal || ''
+          );
+          const visible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return (
+              rect.width > 0 &&
+              rect.height > 0 &&
+              rect.bottom >= 0 &&
+              rect.top <= window.innerHeight &&
+              rect.right >= 0 &&
+              rect.left <= window.innerWidth &&
+              style.display !== 'none' &&
+              style.visibility !== 'hidden'
+            );
+          };
+          const summary = (el) => {
+            const rect = el.getBoundingClientRect();
+            return {
+              tag: el.tagName,
+              id: el.id || '',
+              role: el.getAttribute('role') || '',
+              className: className(el).slice(0, 240),
+              text: clean(el.innerText || el.textContent || '').slice(0, 320),
+              title: clean(el.getAttribute('title')).slice(0, 160),
+              ariaLabel: clean(el.getAttribute('aria-label')).slice(0, 160),
+              ariaChecked: el.getAttribute('aria-checked') || '',
+              ariaExpanded: el.getAttribute('aria-expanded') || '',
+              href: clean(el.getAttribute('href')).slice(0, 240),
+              visible: visible(el),
+              rect: {
+                x: Math.round(rect.x),
+                y: Math.round(rect.y),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
+              },
+            };
+          };
+          const ancestors = (el) => {
+            const out = [];
+            let node = el;
+            for (let depth = 0; node && depth < 7; depth += 1, node = node.parentElement) {
+              out.push(summary(node));
+            }
+            return out;
+          };
+          const unique = (nodes, limit) => {
+            const seen = new Set();
+            const out = [];
+            for (const el of nodes) {
+              const item = summary(el);
+              const key = [
+                item.tag,
+                item.id,
+                item.className,
+                item.text,
+                item.ariaLabel,
+                item.title,
+              ].join('|');
+              if (seen.has(key)) continue;
+              seen.add(key);
+              out.push({
+                ...item,
+                outerHTML: (el.outerHTML || '').slice(0, 1200),
+                ancestors: ancestors(el),
+              });
+              if (out.length >= limit) break;
+            }
+            return out;
+          };
+
+          const currentSelector = [
+            ...document.querySelectorAll(
+              '[role=row], tr, a, button, [title], [aria-label], ' +
+              '[class*=file], [class*=File], [class*=folder], [class*=Folder]'
+            ),
+          ];
+          const all = [...document.querySelectorAll('body *')];
+          const fileText = all.filter((el) => {
+            const text = clean(el.innerText || el.textContent || '');
+            if (!visible(el) || !text || text.length > 360) return false;
+            return (
+              /\\.(pdf|zip|docx?|xlsx?|dwg|rvt|txt)\\b/i.test(text) ||
+              /\\b(addenda?|specifications?|drawings?|general documents)\\b/i.test(text)
+            );
+          }).sort((a, b) =>
+            clean(a.innerText || a.textContent || '').length -
+            clean(b.innerText || b.textContent || '').length
+          );
+          const checkboxLike = [
+            ...document.querySelectorAll(
+              'input, [role=checkbox], [aria-checked], [class*=check], [class*=Check]'
+            ),
+          ].filter(visible);
+          const tabLike = [
+            ...document.querySelectorAll('[role=tab], a, button, [aria-selected]'),
+          ].filter((el) => /files?/i.test(clean([
+            el.innerText || el.textContent || '',
+            el.getAttribute('aria-label') || '',
+            el.getAttribute('title') || '',
+          ].join(' '))));
+
+          const bodyLines = clean(document.body?.innerText || '')
+            .split(/(?=\\b(?:Download All|Name|Indicator|Size|Date Modified)\\b)/i)
+            .filter((line) =>
+              /\\.(pdf|zip|docx?|xlsx?|dwg|rvt|txt)\\b/i.test(line) ||
+              /Download All|Date Modified|addenda?|specifications?|drawings?/i.test(line)
+            )
+            .slice(0, 40)
+            .map((line) => line.slice(0, 500));
+
+          return {
+            url: location.href,
+            title: document.title,
+            viewport: { width: window.innerWidth, height: window.innerHeight },
+            markers: {
+              downloadTestId: Boolean(document.querySelector('[data-testid="download-all-bttn"]')),
+              fileListTools: Boolean(document.querySelector('[data-id="file-list-tools"]')),
+              currentSelectorCount: currentSelector.length,
+              fileTextCount: fileText.length,
+              checkboxLikeCount: checkboxLike.length,
+              tabLikeCount: tabLike.length,
+            },
+            tabs: unique(tabLike, 20),
+            checkboxLike: unique(checkboxLike, 50),
+            fileTextCandidates: unique(fileText, 80),
+            currentSelectorCandidates: unique(currentSelector, 80),
+            bodyLines,
+          };
+        }
+        """
+    )
+    print("\n" + "=" * 70)
+    print("BUILDINGCONNECTED FILES DOM DIAGNOSTICS (READ ONLY)")
+    print("=" * 70)
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    print("=" * 70)
 
 
 def extract_file_name(raw: str) -> str:
@@ -2070,10 +2242,17 @@ def main() -> int:
     parser.add_argument("--project-url", help="Open a known BuildingConnected project URL and skip bid-board search.")
     parser.add_argument("--select-files", action="store_true", help="Select eligible files but do not download.")
     parser.add_argument("--download-files", action="store_true", help="Select eligible files and download them to ~/Downloads.")
+    parser.add_argument(
+        "--diagnose-files-dom",
+        action="store_true",
+        help="Print read-only Files-tab DOM diagnostics after opening the project.",
+    )
     parser.add_argument("--json", action="store_true", help="Print structured JSON result data.")
     parser.add_argument("--output-file", help="Write structured JSON result data to this path.")
     parser.add_argument("--non-interactive", action="store_true", help="Return errors instead of pausing for manual browser fixes.")
     args = parser.parse_args()
+    if args.diagnose_files_dom and args.json:
+        parser.error("--diagnose-files-dom cannot be combined with --json.")
     LOG_ENABLED = not args.json
 
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -2107,6 +2286,9 @@ def main() -> int:
                 download_files=args.download_files,
                 non_interactive=args.non_interactive,
             )
+
+        if args.diagnose_files_dom:
+            print_files_dom_diagnostics(page)
 
         if args.json:
             print(json.dumps(result, indent=2))

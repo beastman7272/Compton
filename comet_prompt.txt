@@ -47,14 +47,24 @@ PROJECT SEARCH RULES:
 
   DO NOT STOP TO ASK FOR PERMISSION OR CONFIRMATION! You must operate unattended.
 
-PROCESS THESE 1 PROJECT(S) IN ORDER:
+PROCESS THESE 2 PROJECT(S) IN ORDER:
 ============================================================
 
-PROJECT 1/1: Dodgen Middle School Renovations
+PROJECT 1/2: Lenora Park Basketball Courts
+----------------------------------------
+Action: Find project → download files only
+Steps:
+  1. Find "Lenora Park Basketball Courts" in the Undecided tab
+  2. Go to the Files tab
+  3. Select files applying the skip rules above
+  4. Click Download Selected, wait 60 seconds
+
+
+PROJECT 2/2: USPS Raeford NC CAX Conversion
 ----------------------------------------
 Action: Find project → note details → download files
 Steps:
-  1. Find "Dodgen Middle School Renovations" in the Undecided tab
+  1. Find "USPS Raeford NC CAX Conversion" in the Undecided tab
   2. Note the Location, Project Size, and Due Date
   3. Go to the Files tab
   4. Open all folders EXCEPT those matching the folder skip list above
