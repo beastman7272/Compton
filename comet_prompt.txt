@@ -50,27 +50,27 @@ PROJECT SEARCH RULES:
 PROCESS THESE 2 PROJECT(S) IN ORDER:
 ============================================================
 
-PROJECT 1/2: Lenora Park Basketball Courts
-----------------------------------------
-Action: Find project → download files only
-Steps:
-  1. Find "Lenora Park Basketball Courts" in the Undecided tab
-  2. Go to the Files tab
-  3. Select files applying the skip rules above
-  4. Click Download Selected, wait 60 seconds
-
-
-PROJECT 2/2: USPS Raeford NC CAX Conversion
+PROJECT 1/2: Heartland Dental TI Leland NC
 ----------------------------------------
 Action: Find project → note details → download files
 Steps:
-  1. Find "USPS Raeford NC CAX Conversion" in the Undecided tab
+  1. Find "Heartland Dental TI Leland NC" in the Undecided tab
   2. Note the Location, Project Size, and Due Date
   3. Go to the Files tab
   4. Open all folders EXCEPT those matching the folder skip list above
      (but DO open folders that also contain Plans/Specifications/Specs)
   5. Select all files EXCEPT those matching the file skip list above
   6. Click Download Selected, wait 60 seconds
+
+
+PROJECT 2/2: Replace Bldg 2 and Bldg 4 Generators
+----------------------------------------
+Action: Find project → download files only
+Steps:
+  1. Find "Replace Bldg 2 and Bldg 4 Generators" in the Undecided tab
+  2. Go to the Files tab
+  3. Select files applying the skip rules above
+  4. Click Download Selected, wait 60 seconds
 
 ============================================================
 REPORT FORMAT — Reply with this EXACT structure for each project:

@@ -217,7 +217,7 @@ def load_excel_rows(file_bytes: bytes, filename: str) -> list[list]:
         "Stage": column_values(df, "Stage"),
         "Project Value": column_values(df, "Project Value"),
         "Update Date": column_values(df, "Update Date"),
-        "Work Type": column_values(df, "Work Type"),
+        "Work Type": column_values(df, "Work Type", required=False),
         "Subcategory": column_values(df, "SubCategory", "Subcategory", "Sub Category", required=False),
     })
 

@@ -150,7 +150,7 @@ def fetch_projects(sheets_service, tab_name: str) -> list[Project]:
             stage=stage,
             project_value=clean(padded[7]),
             update_date=clean(padded[8]),
-            subcategory=clean(padded[9]),
+            subcategory=clean(padded[10]),
             sheet_status=sheet_status,
         )
         

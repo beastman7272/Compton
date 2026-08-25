@@ -59,8 +59,8 @@ def get_sheet_range(sheets_service):
     return f"'{escaped_sheet_name}'!{COLUMNS_RANGE}"
 
 def get_unread_bid_emails(gmail_service):
-    """Fetches unread emails from the specific sender from the last 24 hours."""
-    query = "from:team@buildingconnected.com is:unread newer_than:1d"  #team@buildingconnected.com  #info@comptonsales.com
+    """Fetches unread emails from the specific sender from the last 24 hours (temporarily changed to 5 days)."""
+    query = "from:team@buildingconnected.com is:unread newer_than:5d"  #team@buildingconnected.com  #info@comptonsales.com
     results = gmail_service.users().messages().list(userId='me', q=query).execute()
     return results.get('messages', [])
 

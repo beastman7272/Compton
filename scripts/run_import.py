@@ -349,14 +349,15 @@ def read_constructconnect_rows(service, tab_name: str) -> list[ImportItem]:
     G Stage
     H Project Value
     I Update Date
-    J Subcategory
-    K Download Status
-    L Import/CQE Status
+    J Work Type
+    K Subcategory
+    L Download Status
+    M Import/CQE Status
 
     Rows are ready to import when:
     - Project ID and title exist
-    - K == Processed
-    - L is blank
+    - L == Processed
+    - M is blank
     """
     values = read_values(service, CC_SHEET_ID, sheet_range(tab_name, "A1:M1000"))
 
@@ -372,7 +373,7 @@ def read_constructconnect_rows(service, tab_name: str) -> list[ImportItem]:
         county = clean(padded[4])
         bid_date = clean(padded[5])
         project_value = clean(padded[7])
-        subcategory = clean(padded[9])
+        subcategory = clean(padded[10])
         download_status = clean(padded[11]).lower()
         import_status = clean(padded[12])
 
