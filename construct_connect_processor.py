@@ -119,9 +119,9 @@ def find_matching_messages(gmail_service, subject_text: str) -> list[str]:
     # For local testing, forwarded emails may come from different accounts.
     # Add back f"from:{EMAIL_FROM} " when matching against original production senders.
     queries = [
-        f'subject:"{subject_text}" is:unread newer_than:1d has:attachment',
-        f"subject:{subject_text} is:unread newer_than:1d has:attachment",
-        f'"{subject_text}" is:unread newer_than:1d has:attachment',
+        f'subject:"{subject_text}" is:unread newer_than:5d has:attachment',
+        f"subject:{subject_text} is:unread newer_than:5d has:attachment",
+        f'"{subject_text}" is:unread newer_than:5d has:attachment',
     ]
 
     for query in queries:
