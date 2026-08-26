@@ -7,7 +7,6 @@ import io
 import json
 import re
 import time
-from collections import Counter
 from datetime import datetime
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -113,25 +112,11 @@ def similarity(a: str, b: str) -> float:
 
 
 def likely_match(project: str, candidate_text: str) -> bool:
-    raw_candidate = candidate_text or ""
     target = norm(project)
-    candidate = norm(raw_candidate)
-    truncated_prefix = ""
-    if "..." in raw_candidate or "…" in raw_candidate:
-        truncated_prefix = norm(re.split(r"\.\.\.|…", raw_candidate, maxsplit=1)[0])
-    target_counts = Counter(project_tokens(project))
-    candidate_counts = Counter(candidate.split())
-    hits = sum(min(count, candidate_counts[token]) for token, count in target_counts.items())
-    token_total = sum(target_counts.values())
-    return (
-        target in candidate
-        or (
-            len(project_tokens(truncated_prefix)) >= 2
-            and target.startswith(truncated_prefix)
-        )
-        or (token_total >= 3 and hits >= max(3, token_total - 1))
-        or similarity(project, candidate) >= 0.82
-    )
+    candidate = norm(candidate_text)
+    tokens = project_tokens(project)
+    hits = sum(1 for token in tokens if token in candidate)
+    return target in candidate or hits >= max(3, len(tokens) - 1) or similarity(project, candidate) >= 0.82
 
 
 def bad_candidate_text(value: str) -> bool:
@@ -145,50 +130,6 @@ def bad_candidate_text(value: str) -> bool:
 
 def is_project_detail_url(url: str) -> bool:
     return bool(re.search(r"/opportunities/[0-9a-f]+/", url))
-
-
-def project_detail_panel_is_open(page: Page) -> bool:
-    """Detect BC's SPA detail panel, which may keep the /pipeline URL."""
-    try:
-        return bool(
-            page.evaluate(
-                """
-                () => {
-                  const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                  const visible = (el) => {
-                    const rect = el.getBoundingClientRect();
-                    const style = getComputedStyle(el);
-                    return rect.width > 0 && rect.height > 0 && rect.bottom >= 0 &&
-                      rect.top <= window.innerHeight && style.display !== 'none' &&
-                      style.visibility !== 'hidden';
-                  };
-                  const labels = [...document.querySelectorAll('a, button, [role=tab]')]
-                    .filter(visible)
-                    .map((el) => clean(el.innerText || el.textContent || ''));
-                  return labels.some((x) => /^files(?:\\s+\\d+)?$/.test(x)) &&
-                    labels.some((x) => /^messages(?:\\s+\\d+)?$/.test(x)) &&
-                    labels.some((x) => /^bid form$/.test(x));
-                }
-                """
-            )
-        )
-    except Exception:
-        return False
-
-
-def is_project_detail_view(page: Page) -> bool:
-    return is_project_detail_url(page.url) or project_detail_panel_is_open(page)
-
-
-def is_bid_board_url(url: str) -> bool:
-    """True only for the BuildingConnected opportunity pipeline itself."""
-    return bool(
-        re.match(
-            r"^https://app\.buildingconnected\.com/opportunities/pipeline(?:[/?#]|$)",
-            url or "",
-            re.I,
-        )
-    )
 
 
 def pause_for_user(reason: str) -> None:
@@ -657,11 +598,28 @@ def click_best_dom_candidate(page: Page, project: str) -> Candidate | None:
 
 def click_project_text_fallback(page: Page, project: str) -> bool:
     log("Trying visible project text/coordinate fallbacks")
-    if not is_bid_board_url(page.url):
-        log(f"Skipping project-text fallback outside Bid Board: {page.url}")
-        return False
+    for exact in (True, False):
+        try:
+            locator = page.get_by_text(project, exact=exact).first
+            locator.wait_for(state="visible", timeout=4_000)
+            locator.scroll_into_view_if_needed(timeout=4_000)
+            log(f"Trying text click fallback exact={exact}")
+            locator.click(timeout=4_000)
+            page.wait_for_timeout(2_000)
+            if is_project_detail_url(page.url):
+                return True
 
-    board_url = page.url
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(2_000)
+            if is_project_detail_url(page.url):
+                return True
+
+            locator.dblclick(timeout=4_000)
+            page.wait_for_timeout(2_000)
+            if is_project_detail_url(page.url):
+                return True
+        except Exception:
+            pass
 
     boxes = page.evaluate(
         """
@@ -669,8 +627,7 @@ def click_project_text_fallback(page: Page, project: str) -> bool:
           const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
           const targetLower = clean(target).toLowerCase();
           const boxes = [];
-          const seen = new Set();
-          const nodes = [...document.querySelectorAll('a,button,[role=row],tr,li,div,span')];
+          const nodes = [...document.querySelectorAll('a,button,[role=row],tr,div,span')];
 
           for (const el of nodes) {
             const text = clean(el.innerText || el.textContent || '');
@@ -678,33 +635,24 @@ def click_project_text_fallback(page: Page, project: str) -> bool:
 
             const chain = [el];
             let parent = el.parentElement;
-            for (let i = 0; parent && i < 10; i += 1, parent = parent.parentElement) {
+            for (let i = 0; parent && i < 5; i += 1, parent = parent.parentElement) {
               chain.push(parent);
             }
 
             for (const node of chain) {
               const rect = node.getBoundingClientRect();
-              const rowText = clean(node.innerText || node.textContent || '');
-              const rowLower = rowText.toLowerCase();
-              const rowLike =
-                /\\d{1,2}\\/\\d{1,2}\\/\\d{4}/.test(rowText) &&
-                rowLower.includes('bidding') &&
-                rowLower.includes('decline');
-              if (!rowLike || rect.width < 500 || rect.height < 24 || rect.height > 220) continue;
+              if (rect.width < 20 || rect.height < 12) continue;
               if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
               if (rect.right < 0 || rect.left > window.innerWidth) continue;
-              if (seen.has(node)) continue;
-              seen.add(node);
 
               boxes.push({
                 tag: node.tagName,
                 role: node.getAttribute('role') || '',
                 cls: String(node.className || '').slice(0, 80),
-                text: rowText.slice(0, 160),
+                text: clean(node.innerText || node.textContent || '').slice(0, 160),
                 x: Math.max(5, Math.min(rect.left + Math.min(120, rect.width / 2), window.innerWidth - 5)),
                 y: Math.max(5, Math.min(rect.top + Math.min(24, rect.height / 2), window.innerHeight - 5)),
               });
-              break;
             }
           }
 
@@ -721,30 +669,16 @@ def click_project_text_fallback(page: Page, project: str) -> bool:
         page.wait_for_timeout(2_000)
         if is_project_detail_url(page.url):
             return True
-        if not is_bid_board_url(page.url):
-            log(f"Fallback left Bid Board; restoring pipeline from {page.url}")
-            page.goto(board_url, wait_until="commit", timeout=NAV_TIMEOUT_MS)
-            page.wait_for_timeout(2_500)
-            return False
 
         page.mouse.dblclick(box["x"], box["y"])
         page.wait_for_timeout(2_000)
         if is_project_detail_url(page.url):
             return True
-        if not is_bid_board_url(page.url):
-            log(f"Fallback left Bid Board; restoring pipeline from {page.url}")
-            page.goto(board_url, wait_until="commit", timeout=NAV_TIMEOUT_MS)
-            page.wait_for_timeout(2_500)
-            return False
 
     return False
 
 
 def scroll_bid_board(page: Page) -> bool:
-    if project_detail_panel_is_open(page):
-        log("Refusing to scroll Bid Board while a project detail panel is open")
-        return False
-
     before_text = page.locator("body").inner_text(timeout=5_000)[:4_000]
     # Advance most of a viewport but keep ~1-2 rows of overlap so lazy-loaded
     # projects are not skipped between scans.
@@ -799,69 +733,34 @@ def scroll_bid_board(page: Page) -> bool:
     return after_key != before_text
 
 
-def current_project_heading(page: Page) -> str:
-    """Read the visible project title at the top of an opportunity detail page."""
+def detail_page_matches_project(page: Page, project: str) -> bool:
+    """True when the open opportunity page is the intended project (full name available)."""
+    if not is_project_detail_url(page.url):
+        return False
+
     try:
-        headings = page.evaluate(
-            """
-            () => {
-              const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-              const visible = (el) => {
-                const rect = el.getBoundingClientRect();
-                const style = getComputedStyle(el);
-                return (
-                  rect.width > 80 && rect.height > 12 && rect.top >= 0 && rect.top < 260 &&
-                  rect.bottom <= window.innerHeight && style.display !== 'none' &&
-                  style.visibility !== 'hidden' && Number(style.opacity || 1) !== 0
-                );
-              };
-              const generic = /^(overview|files|messages|bid form|due date|status|links)$/i;
-              const nodes = [...document.querySelectorAll(
-                'h1, h2, [role=heading], [data-testid*="project" i], [class*="project-title" i], [class*="opportunity-title" i]'
-              )];
-              const out = [];
-              const seen = new Set();
-              for (const el of nodes) {
-                if (!visible(el)) continue;
-                const text = clean(el.innerText || el.textContent || el.getAttribute('title') || '');
-                if (text.length < 4 || text.length > 240 || generic.test(text)) continue;
-                const key = text.toLowerCase();
-                if (seen.has(key)) continue;
-                seen.add(key);
-                const rect = el.getBoundingClientRect();
-                out.push({ text, top: rect.top, size: parseFloat(getComputedStyle(el).fontSize) || 0 });
-              }
-              return out.sort((a, b) => b.size - a.size || a.top - b.top).map((x) => x.text);
-            }
-            """
-        )
+        title = page.title()
     except Exception:
-        headings = []
+        title = ""
+    if title and likely_match(project, title):
+        return True
 
-    if headings:
-        return str(headings[0]).strip()
-
-    # The current BC layout places the project name on the first visible text
-    # line. Keep this deliberately narrow so stale/background bid-board text or
-    # Recently Viewed entries cannot validate the wrong opportunity.
     try:
-        body = page.locator("body").inner_text(timeout=3_000)
+        body = page.locator("body").inner_text(timeout=5_000)
     except Exception:
-        return ""
-    return next((line.strip() for line in body.splitlines() if 4 <= len(line.strip()) <= 240), "")
+        body = ""
 
+    for line in (ln.strip() for ln in body.splitlines() if ln.strip()):
+        if len(line) > 260:
+            continue
+        if likely_match(project, line):
+            return True
 
-def detail_page_matches_project(page: Page, project: str, *, timeout_ms: int = 10_000) -> bool:
-    """True only when the visible detail-page heading is the intended project."""
-    deadline = time.monotonic() + max(timeout_ms, 0) / 1_000
-    while True:
-        if is_project_detail_view(page):
-            heading = current_project_heading(page)
-            if heading and likely_match(project, heading):
-                return True
-        if time.monotonic() >= deadline:
-            return False
-        page.wait_for_timeout(400)
+    if body and likely_match(project, body[:2_000]):
+        return True
+
+    candidates = [c for c in dom_candidates(page, project) if not bad_candidate_text(c.combined)]
+    return bool(candidates and likely_match(project, candidates[0].combined))
 
 
 def accept_opened_project(
@@ -872,13 +771,12 @@ def accept_opened_project(
     tag: str = "",
     href: str = "",
 ) -> Candidate | None:
-    if not is_project_detail_view(page):
+    if not is_project_detail_url(page.url):
         return None
     if not detail_page_matches_project(page, project):
-        heading = current_project_heading(page) or "-- unavailable --"
         log(
             "Detail page does not match target project "
-            f"(visible heading: {heading[:120]}; opened row: {(matched_text or page.url)[:120]})"
+            f"(opened text: {(matched_text or page.url)[:120]})"
         )
         return None
     log("Confirmed opened detail page matches target project")
@@ -892,7 +790,7 @@ def return_to_undecided_board(page: Page, *, non_interactive: bool = True) -> No
         page.go_back(wait_until="commit", timeout=NAV_TIMEOUT_MS)
         page.wait_for_timeout(2_000)
 
-    if is_project_detail_view(page) or "pipeline" not in (page.url or "").lower():
+    if is_project_detail_url(page.url) or "pipeline" not in (page.url or "").lower():
         ensure_pipeline(page, non_interactive=non_interactive)
         sort_by_name(page)
         return
@@ -903,29 +801,117 @@ def return_to_undecided_board(page: Page, *, non_interactive: bool = True) -> No
 
 
 def open_exact_project_text(page: Page, project: str) -> Candidate | None:
-    # Work only from structurally verified bid rows. A loose get_by_text() can
-    # match a hidden location/address node and navigate to Google Maps instead
-    # of opening the opportunity.
-    for row in visible_bid_rows(page):
-        label = row_label(row.text)
-        if norm(project) not in norm(row.text) and not likely_match(project, label):
+    # Only consider row-sized nodes. Fat ancestors can contain the target name
+    # somewhere below the fold while their first opportunity link is a different project.
+    boxes = page.evaluate(
+        """
+        (project) => {
+          const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+          const target = clean(project).toLowerCase();
+          if (!target) return [];
+          const out = [];
+          const nodes = [...document.querySelectorAll(
+            '[role=row], tr, a[href*="/opportunities/"], [class*=Row], [class*=row]'
+          )];
+
+          for (const el of nodes) {
+            const text = clean(el.innerText || el.textContent || '');
+            if (text.length < 10 || text.length > 500) continue;
+            if (!text.toLowerCase().includes(target)) continue;
+
+            const lower = text.toLowerCase();
+            if (lower.includes('filtered by') || lower.includes('assign name bid date')) continue;
+
+            const rect = el.getBoundingClientRect();
+            const visible =
+              rect.width > 40 &&
+              rect.height > 12 &&
+              rect.bottom >= 0 &&
+              rect.top <= window.innerHeight &&
+              rect.right >= 0 &&
+              rect.left <= window.innerWidth;
+            if (!visible) continue;
+
+            let link = null;
+            if (el.matches?.('a[href*="/opportunities/"]')) {
+              link = el;
+            } else {
+              link = el.querySelector?.('a[href*="/opportunities/"]') || null;
+            }
+
+            out.push({
+              tag: el.tagName,
+              text,
+              href: link?.href || '',
+              x: Math.max(5, Math.min(rect.left + Math.min(180, rect.width / 3), window.innerWidth - 5)),
+              y: Math.max(5, Math.min(rect.top + rect.height / 2, window.innerHeight - 5)),
+            });
+          }
+
+          return out.sort((a, b) => a.text.length - b.text.length).slice(0, 8);
+        }
+        """,
+        project,
+    )
+
+    for box in boxes:
+        label = row_label(box["text"])
+        if norm(project) not in norm(box["text"]) and not likely_match(project, label):
             continue
 
-        log(f"Found matching project row in visible DOM: {row.text[:120]}")
-        opened = open_bid_row(page, row, project)
+        log(f"Found exact project text in visible DOM: {box['text'][:120]}")
+        opened = False
+        if box["href"]:
+            page.goto(box["href"], wait_until="commit", timeout=NAV_TIMEOUT_MS)
+            page.wait_for_timeout(2_500)
+            opened = is_project_detail_url(page.url)
+
+        if not opened:
+            for click_count in (1, 2):
+                page.mouse.click(box["x"], box["y"], click_count=click_count)
+                page.wait_for_timeout(2_500)
+                if is_project_detail_url(page.url):
+                    opened = True
+                    break
+
         if not opened:
             continue
 
         accepted = accept_opened_project(
             page,
             project,
-            matched_text=row.text,
-            tag=row.tag,
-            href=row.href or page.url,
+            matched_text=box["text"],
+            tag=box["tag"],
+            href=box["href"] or page.url,
         )
         if accepted:
             return accepted
         return_to_undecided_board(page)
+
+    try:
+        locator = page.get_by_text(project, exact=False).first
+        locator.wait_for(state="attached", timeout=1_500)
+        locator.scroll_into_view_if_needed(timeout=4_000)
+        page.wait_for_timeout(800)
+        log("Found exact project text outside visible-row scan")
+
+        opened = False
+        for click_count in (1, 2):
+            locator.click(timeout=4_000, click_count=click_count)
+            page.wait_for_timeout(2_500)
+            if is_project_detail_url(page.url):
+                opened = True
+                break
+
+        if not opened and click_project_text_fallback(page, project):
+            opened = is_project_detail_url(page.url)
+
+        if opened:
+            accepted = accept_opened_project(page, project, matched_text=project, tag="TEXT")
+            if accepted:
+                return accepted
+            return_to_undecided_board(page)
+    except Exception:
         return None
 
     return None
@@ -946,13 +932,6 @@ def reset_bid_board_scroll(page: Page) -> None:
 
 
 def go_to_next_bid_board_page(page: Page) -> bool:
-    if project_detail_panel_is_open(page):
-        log("Refusing next-page click while a project detail panel is open")
-        return False
-    if not is_bid_board_url(page.url):
-        log(f"Refusing next-page click outside Bid Board: {page.url}")
-        return False
-
     changed = page.evaluate(
         """
         () => {
@@ -971,14 +950,7 @@ def go_to_next_bid_board_page(page: Page) -> bool:
               el.getAttribute('aria-disabled') === 'true' ||
               /disabled/i.test(el.className || '');
 
-            const pagination = el.closest(
-              'nav, [aria-label*="pagination" i], [class*="pagination" i], [class*="pager" i]'
-            );
-            const nextLabel =
-              /^(next|next page|go to next page|caret-right|›|»)$/i.test(label) ||
-              /\\bnext (page|results?)\\b/i.test(label);
-
-            if (!disabled && pagination && nextLabel) {
+            if (!disabled && /(^|\\b)(next|caret-right|›|»)(\\b|$)/i.test(label)) {
               el.scrollIntoView({ block: 'center' });
               el.click();
               return true;
@@ -996,61 +968,14 @@ def go_to_next_bid_board_page(page: Page) -> bool:
 
 
 def visible_bid_rows(page: Page) -> list[BidRow]:
-    if not is_bid_board_url(page.url):
-        return []
-
     rows = page.evaluate(
         """
         () => {
           const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-          const rowLike = (el) => {
-            const text = clean(el.innerText || el.textContent || '');
-            const lower = text.toLowerCase();
-            const rect = el.getBoundingClientRect();
-            return (
-              /\\d{1,2}\\/\\d{1,2}\\/\\d{4}/.test(text) &&
-              lower.includes('bidding') &&
-              lower.includes('decline') &&
-              text.length >= 25 &&
-              text.length <= 700 &&
-              rect.width >= 500 &&
-              rect.height >= 24 &&
-              rect.height <= 220
-            );
-          };
-
-          const nodes = [];
-          const nodeSet = new Set();
-          const addNode = (el) => {
-            if (el && !nodeSet.has(el)) {
-              nodeSet.add(el);
-              nodes.push(el);
-            }
-          };
-
-          // The current BuildingConnected board renders rows as ordinary divs
-          // without a stable "row" class. Each row does, however, contain its
-          // due date and the Bidding/Decline actions, so climb from those actions
-          // to the smallest ancestor with the complete row signature.
-          const actions = [...document.querySelectorAll('button, a, [role=button]')]
-            .filter((el) => /^(bidding|decline)$/i.test(clean(el.innerText || el.textContent || '')));
-          for (const action of actions) {
-            let el = action;
-            for (let depth = 0; el && depth < 12; depth += 1, el = el.parentElement) {
-              if (rowLike(el)) {
-                addNode(el);
-                break;
-              }
-            }
-          }
-
-          // Preserve support for older table/ARIA/class-based versions.
-          for (const el of document.querySelectorAll(
-            '[role=row], tr, li, [class*="row" i]'
-          )) {
-            if (rowLike(el)) addNode(el);
-          }
-
+          const nodes = [...document.querySelectorAll(
+            '[role=row], tr, [class*=Row], [class*=row]'
+          )];
+          const seen = new Set();
           const out = [];
 
           for (const el of nodes) {
@@ -1059,10 +984,20 @@ def visible_bid_rows(page: Page) -> list[BidRow]:
             if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
 
             const text = clean(el.innerText || el.textContent || '');
-            if (text.length < 25 || text.length > 700) continue;
+            if (text.length < 25 || text.length > 500) continue;
 
             const lower = text.toLowerCase();
             if (lower.includes('filtered by') || lower.includes('assign name bid date')) continue;
+
+            const rowLike =
+              /\\d{1,2}\\/\\d{1,2}\\/\\d{4}/.test(text) ||
+              /\\d+h\\s+\\d+m/.test(text) ||
+              lower.includes('bidding') ||
+              lower.includes('decline');
+            if (!rowLike) continue;
+
+            if (seen.has(text)) continue;
+            seen.add(text);
 
             const link = el.querySelector?.('a[href*="/opportunities/"]') || el.closest?.('a[href*="/opportunities/"]');
             out.push({
@@ -1079,21 +1014,7 @@ def visible_bid_rows(page: Page) -> list[BidRow]:
         }
         """
     )
-    bid_rows = [BidRow(**row) for row in rows]
-    deduped: list[BidRow] = []
-    for row in bid_rows:
-        duplicate = any(
-            abs(row.y - prior.y) < 8
-            and (
-                norm(row.text) == norm(prior.text)
-                or norm(row.text) in norm(prior.text)
-                or norm(prior.text) in norm(row.text)
-            )
-            for prior in deduped
-        )
-        if not duplicate:
-            deduped.append(row)
-    return deduped
+    return [BidRow(**row) for row in rows]
 
 
 def row_label(text: str) -> str:
@@ -1109,146 +1030,39 @@ def print_visible_bid_rows(scan: int, rows: list[BidRow]) -> None:
 
 
 def row_matches_project(project: str, row: BidRow) -> bool:
-    # Count repeated words instead of using set-style membership. This keeps the
-    # truncated-name fallback while distinguishing, for example,
-    # "Crossroads of Gallatin - Gallatin..." from "Crossroads of Gallatin".
-    return likely_match(project, row_label(row.text))
+    target = norm(project)
+    row_text = norm(row.text)
+    return target in row_text or all(token in row_text for token in project_tokens(project))
 
 
-def open_bid_row(page: Page, row: BidRow, project: str = "") -> bool:
+def open_bid_row(page: Page, row: BidRow) -> bool:
     if row.href:
         log(f"Opening row href directly: {row.href}")
         page.goto(row.href, wait_until="commit", timeout=NAV_TIMEOUT_MS)
         page.wait_for_timeout(3_000)
-        if project:
-            return detail_page_matches_project(page, project, timeout_ms=8_000)
-        return is_project_detail_view(page)
+        return is_project_detail_url(page.url)
 
-    # Refresh the row coordinates immediately before clicking. BuildingConnected
-    # virtualizes the board, so a saved y-coordinate can point at a different
-    # project after a lazy-load/layout update.
-    live_rows = visible_bid_rows(page)
-    exact_rows = [candidate for candidate in live_rows if norm(candidate.text) == norm(row.text)]
-    if not exact_rows:
-        expected_label = norm(row_label(row.text))
-        exact_rows = [
-            candidate
-            for candidate in live_rows
-            if norm(row_label(candidate.text)) == expected_label
-        ]
-    if exact_rows:
-        row = min(exact_rows, key=lambda candidate: abs(candidate.y - row.y))
-
-    clicked = page.evaluate(
-        """
-        ({ expectedText, expectedLabel, project, priorY }) => {
-          const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-          const norm = (s) => clean(s).toLowerCase().replace(/[^\\w\\s]/g, ' ').replace(/\\s+/g, ' ').trim();
-          const rowLabel = (s) => clean(s).split(/\\b\\d{1,2}\\/\\d{1,2}\\/\\d{4}\\b/)[0];
-          const rowLike = (el) => {
-            const text = clean(el.innerText || el.textContent || '');
-            const lower = text.toLowerCase();
-            const rect = el.getBoundingClientRect();
-            return /\\d{1,2}\\/\\d{1,2}\\/\\d{4}/.test(text) &&
-              lower.includes('bidding') && lower.includes('decline') &&
-              rect.width >= 500 && rect.height >= 24 && rect.height <= 220;
-          };
-
-          const rows = [];
-          const seen = new Set();
-          const add = (el) => {
-            if (el && !seen.has(el) && rowLike(el)) {
-              seen.add(el);
-              rows.push(el);
-            }
-          };
-          for (const action of document.querySelectorAll('button, a, [role=button]')) {
-            if (!/^(bidding|decline)$/i.test(clean(action.innerText || action.textContent || ''))) continue;
-            let el = action;
-            for (let depth = 0; el && depth < 12; depth += 1, el = el.parentElement) {
-              if (rowLike(el)) {
-                add(el);
-                break;
-              }
-            }
-          }
-          for (const el of document.querySelectorAll('[role=row], tr, li, [class*="row" i]')) add(el);
-
-          const expectedTextNorm = norm(expectedText);
-          const expectedLabelNorm = norm(expectedLabel);
-          const matches = rows.filter((el) => {
-            const text = clean(el.innerText || el.textContent || '');
-            return norm(text) === expectedTextNorm || norm(rowLabel(text)) === expectedLabelNorm;
-          }).sort((a, b) =>
-            Math.abs(a.getBoundingClientRect().top + a.getBoundingClientRect().height / 2 - priorY) -
-            Math.abs(b.getBoundingClientRect().top + b.getBoundingClientRect().height / 2 - priorY)
-          );
-          if (!matches.length) return { ok: false, reason: 'matched row no longer visible' };
-
-          const row = matches[0];
-          const projectNorm = norm(project);
-          const choices = [...row.querySelectorAll('a, button, [role=link], div, span')]
-            .map((el) => {
-              const text = clean(el.innerText || el.textContent || '');
-              const textNorm = norm(text);
-              const rect = el.getBoundingClientRect();
-              const truncatedPrefix = text.includes('...') || text.includes('…')
-                ? norm(text.split(/\\.\\.\\.|…/)[0]) : '';
-              const projectMatch = projectNorm && (
-                textNorm.includes(projectNorm) ||
-                (truncatedPrefix.split(' ').length >= 2 && projectNorm.startsWith(truncatedPrefix))
-              );
-              const labelMatch = !projectNorm && expectedLabelNorm.startsWith(textNorm) &&
-                textNorm.split(' ').length >= 2;
-              return { el, text, textNorm, rect, projectMatch, labelMatch };
-            })
-            .filter((item) =>
-              item.rect.width > 0 && item.rect.height > 0 &&
-              !/^(bidding|decline)$/i.test(item.text) &&
-              !/\\d{1,2}\\/\\d{1,2}\\/\\d{4}/.test(item.text) &&
-              (item.projectMatch || item.labelMatch)
-            )
-            .sort((a, b) => {
-              const aSemantic = a.el.matches('a, button, [role=link]') ? 1 : 0;
-              const bSemantic = b.el.matches('a, button, [role=link]') ? 1 : 0;
-              if (aSemantic !== bSemantic) return bSemantic - aSemantic;
-              return projectNorm ? a.text.length - b.text.length : b.text.length - a.text.length;
-            });
-          if (!choices.length) return { ok: false, reason: 'project-name element not found' };
-
-          const target = choices[0].el;
-          target.scrollIntoView({ block: 'center', inline: 'nearest' });
-          target.click();
-          return { ok: true, text: choices[0].text, tag: target.tagName };
-        }
-        """,
-        {
-            "expectedText": row.text,
-            "expectedLabel": row_label(row.text),
-            "project": project,
-            "priorY": row.y,
-        },
-    )
-    if not clicked or not clicked.get("ok"):
-        reason = (clicked or {}).get("reason", "unknown")
-        log(f"Could not click matched project-name element: {reason}")
-        return False
-
-    log(f"Clicked matched project-name element: {clicked.get('text', '')[:120]}")
-    page.wait_for_timeout(2_500)
-    if project:
-        return detail_page_matches_project(page, project, timeout_ms=8_000)
-    return is_project_detail_view(page)
+    log(f"Opening matching row by coordinates: {row_label(row.text)}")
+    for click_count in (1, 2):
+        page.mouse.click(row.x, row.y, click_count=click_count)
+        page.wait_for_timeout(2_500)
+        if is_project_detail_url(page.url):
+            return True
+    return False
 
 
 def current_page_has_project(page: Page, project: str) -> Candidate | None:
-    if not is_project_detail_view(page):
+    if not is_project_detail_url(page.url):
         return None
 
-    if detail_page_matches_project(page, project, timeout_ms=1_500):
-        heading = current_project_heading(page)
+    candidates = [c for c in dom_candidates(page, project) if not bad_candidate_text(c.combined)]
+    if not candidates:
+        return None
+
+    best = candidates[0]
+    if likely_match(project, best.combined):
         log("Current page already appears to be the target project")
-        return Candidate(heading or project, "", "", "HEADING", 2.0, page.url)
+        return best
 
     return None
 
@@ -1317,7 +1131,7 @@ def find_and_open_project(page: Page, project: str) -> Candidate | None:
                 continue
 
             log(f"Matched visible row: {row_label(row.text)}")
-            if open_bid_row(page, row, project):
+            if open_bid_row(page, row) or click_project_text_fallback(page, project):
                 accepted = accept_opened_project(
                     page,
                     project,
@@ -1400,84 +1214,12 @@ def print_detail_hints(page: Page) -> None:
             print(f"  {line[:180]}")
 
 
-def require_project_identity(page: Page, project: str, phase: str) -> None:
-    """Stop before file actions if the visible opportunity title changed."""
-    if not project:
-        return
-    if detail_page_matches_project(page, project, timeout_ms=4_000):
-        return
-    heading = current_project_heading(page) or "-- unavailable --"
-    raise RuntimeError(
-        f"Project identity changed {phase}: expected {project!r}, "
-        f"but the visible heading is {heading!r}. Refusing to select or download files."
-    )
-
-
-def files_view_is_ready(page: Page) -> bool:
-    try:
-        return bool(
-            page.evaluate(
-                """
-                () => {
-                  const visible = (el) => {
-                    if (!el) return false;
-                    const rect = el.getBoundingClientRect();
-                    const style = getComputedStyle(el);
-                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' &&
-                      style.visibility !== 'hidden';
-                  };
-                  return [...document.querySelectorAll(
-                    '[data-id="file-list-tools"], [role=grid][aria-label=grid], button, a'
-                  )].some((el) => {
-                    if (!visible(el)) return false;
-                    const text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
-                    return el.matches('[data-id="file-list-tools"], [role=grid][aria-label=grid]') ||
-                      /^(download all|download selected)$/i.test(text);
-                  });
-                }
-                """
-            )
-        )
-    except Exception:
-        return False
-
-
-def open_files_tab(page: Page, *, expected_project: str = "") -> bool:
+def open_files_tab(page: Page) -> bool:
     log("Opening Files tab")
-    require_project_identity(page, expected_project, "before opening the Files tab")
-
-    if not files_view_is_ready(page):
-        try:
-            clicked = page.evaluate(
-                """
-                () => {
-                  const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-                  const visible = (el) => {
-                    const rect = el.getBoundingClientRect();
-                    const style = getComputedStyle(el);
-                    return rect.width > 0 && rect.height > 0 && rect.top >= 0 && rect.top < 280 &&
-                      style.display !== 'none' && style.visibility !== 'hidden';
-                  };
-                  const tabs = [...document.querySelectorAll('a, button, [role=tab]')]
-                    .filter((el) => visible(el) && /^(files(?:\\s+\\d+)?|project files|documents)$/i.test(clean(el.innerText || el.textContent || '')))
-                    .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
-                  if (!tabs.length) return false;
-                  tabs[0].click();
-                  return true;
-                }
-                """
-            )
-        except Exception:
-            clicked = False
-        if not clicked:
-            return False
-
-    deadline = time.monotonic() + 12
-    while time.monotonic() < deadline:
-        require_project_identity(page, expected_project, "while opening the Files tab")
-        if files_view_is_ready(page):
+    for text in ("Files", "Project Files", "Documents"):
+        if click_text_if_visible(page, text, timeout=8_000):
+            page.wait_for_timeout(4_000)
             return True
-        page.wait_for_timeout(400)
     return False
 
 
@@ -2073,11 +1815,9 @@ def preview_allowed_folders(page: Page) -> None:
         return_to_files_root(page, root_url)
 
 
-def select_allowed_files(page: Page, *, expected_project: str = "") -> list[str]:
+def select_allowed_files(page: Page) -> list[str]:
     selected: list[str] = []
-    require_project_identity(page, expected_project, "before resetting the Files view")
     reset_files_view(page)
-    require_project_identity(page, expected_project, "after resetting the Files view")
 
     root_rows = classified_file_items(page)
     root_names = {name.lower() for _kind, _action, name, _reason in root_rows}
@@ -2094,7 +1834,6 @@ def select_allowed_files(page: Page, *, expected_project: str = "") -> list[str]
 
     root_url = page.url
     for folder_name in folders:
-        require_project_identity(page, expected_project, f"before opening folder {folder_name!r}")
         if not open_folder_by_name(page, folder_name):
             print(f"\nSelection Preview ({folder_name}): -- could not open folder --")
             continue
@@ -2106,7 +1845,6 @@ def select_allowed_files(page: Page, *, expected_project: str = "") -> list[str]
         ]
         selected.extend(select_classified_files(page, child_rows, folder_name))
         return_to_files_root(page, root_url)
-        require_project_identity(page, expected_project, f"after returning from folder {folder_name!r}")
 
     print("\nSelected Files Summary:")
     if selected:
@@ -2418,39 +2156,28 @@ def process_project(
         if not candidate:
             return result
 
-        if not is_project_detail_view(page):
+        result["status"] = "FOUND"
+        result["matched_text"] = candidate.combined[:220]
+
+        if not is_project_detail_url(page.url):
             result["status"] = "ERROR"
             result["error"] = "Project matched, but the detail page did not open."
             return result
-
-        if not detail_page_matches_project(page, project):
-            heading = current_project_heading(page) or "-- unavailable --"
-            result["status"] = "ERROR"
-            result["error"] = (
-                f"Opened the wrong project. Expected {project!r}, but the visible "
-                f"heading is {heading!r}."
-            )
-            return result
-
-        result["status"] = "FOUND"
-        result["matched_text"] = candidate.combined[:220]
 
         details = extract_details(page)
         result["location"] = details.get("Location", "") or "--"
         result["project_size"] = details.get("Project Size", "") or "--"
         result["due_date"] = details.get("Due Date", "") or "--"
 
-        if not open_files_tab(page, expected_project=project):
-            result["status"] = "ERROR"
+        if not open_files_tab(page):
             result["error"] = "Files tab was not found/opened."
             return result
 
         if select_files or download_files:
-            selected = select_allowed_files(page, expected_project=project)
+            selected = select_allowed_files(page)
             result["files"] = selected
             if download_files:
                 if selected:
-                    require_project_identity(page, project, "immediately before download")
                     result["download_path"] = str(
                         download_selected_files(page, len(selected))
                     )
