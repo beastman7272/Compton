@@ -132,6 +132,17 @@ def is_project_detail_url(url: str) -> bool:
     return bool(re.search(r"/opportunities/[0-9a-f]+/", url))
 
 
+def is_bid_board_url(url: str) -> bool:
+    """True only for the BuildingConnected opportunity pipeline itself."""
+    return bool(
+        re.match(
+            r"^https://app\.buildingconnected\.com/opportunities/pipeline(?:[/?#]|$)",
+            url or "",
+            re.I,
+        )
+    )
+
+
 def pause_for_user(reason: str) -> None:
     print(f"\n{reason}")
     input("Fix/confirm the browser state, then press Enter to continue...")
@@ -598,28 +609,11 @@ def click_best_dom_candidate(page: Page, project: str) -> Candidate | None:
 
 def click_project_text_fallback(page: Page, project: str) -> bool:
     log("Trying visible project text/coordinate fallbacks")
-    for exact in (True, False):
-        try:
-            locator = page.get_by_text(project, exact=exact).first
-            locator.wait_for(state="visible", timeout=4_000)
-            locator.scroll_into_view_if_needed(timeout=4_000)
-            log(f"Trying text click fallback exact={exact}")
-            locator.click(timeout=4_000)
-            page.wait_for_timeout(2_000)
-            if is_project_detail_url(page.url):
-                return True
+    if not is_bid_board_url(page.url):
+        log(f"Skipping project-text fallback outside Bid Board: {page.url}")
+        return False
 
-            page.keyboard.press("Enter")
-            page.wait_for_timeout(2_000)
-            if is_project_detail_url(page.url):
-                return True
-
-            locator.dblclick(timeout=4_000)
-            page.wait_for_timeout(2_000)
-            if is_project_detail_url(page.url):
-                return True
-        except Exception:
-            pass
+    board_url = page.url
 
     boxes = page.evaluate(
         """
@@ -627,7 +621,8 @@ def click_project_text_fallback(page: Page, project: str) -> bool:
           const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
           const targetLower = clean(target).toLowerCase();
           const boxes = [];
-          const nodes = [...document.querySelectorAll('a,button,[role=row],tr,div,span')];
+          const seen = new Set();
+          const nodes = [...document.querySelectorAll('a,button,[role=row],tr,li,div,span')];
 
           for (const el of nodes) {
             const text = clean(el.innerText || el.textContent || '');
@@ -635,24 +630,33 @@ def click_project_text_fallback(page: Page, project: str) -> bool:
 
             const chain = [el];
             let parent = el.parentElement;
-            for (let i = 0; parent && i < 5; i += 1, parent = parent.parentElement) {
+            for (let i = 0; parent && i < 10; i += 1, parent = parent.parentElement) {
               chain.push(parent);
             }
 
             for (const node of chain) {
               const rect = node.getBoundingClientRect();
-              if (rect.width < 20 || rect.height < 12) continue;
+              const rowText = clean(node.innerText || node.textContent || '');
+              const rowLower = rowText.toLowerCase();
+              const rowLike =
+                /\\d{1,2}\\/\\d{1,2}\\/\\d{4}/.test(rowText) &&
+                rowLower.includes('bidding') &&
+                rowLower.includes('decline');
+              if (!rowLike || rect.width < 500 || rect.height < 24 || rect.height > 220) continue;
               if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
               if (rect.right < 0 || rect.left > window.innerWidth) continue;
+              if (seen.has(node)) continue;
+              seen.add(node);
 
               boxes.push({
                 tag: node.tagName,
                 role: node.getAttribute('role') || '',
                 cls: String(node.className || '').slice(0, 80),
-                text: clean(node.innerText || node.textContent || '').slice(0, 160),
+                text: rowText.slice(0, 160),
                 x: Math.max(5, Math.min(rect.left + Math.min(120, rect.width / 2), window.innerWidth - 5)),
                 y: Math.max(5, Math.min(rect.top + Math.min(24, rect.height / 2), window.innerHeight - 5)),
               });
+              break;
             }
           }
 
@@ -669,11 +673,21 @@ def click_project_text_fallback(page: Page, project: str) -> bool:
         page.wait_for_timeout(2_000)
         if is_project_detail_url(page.url):
             return True
+        if not is_bid_board_url(page.url):
+            log(f"Fallback left Bid Board; restoring pipeline from {page.url}")
+            page.goto(board_url, wait_until="commit", timeout=NAV_TIMEOUT_MS)
+            page.wait_for_timeout(2_500)
+            return False
 
         page.mouse.dblclick(box["x"], box["y"])
         page.wait_for_timeout(2_000)
         if is_project_detail_url(page.url):
             return True
+        if not is_bid_board_url(page.url):
+            log(f"Fallback left Bid Board; restoring pipeline from {page.url}")
+            page.goto(board_url, wait_until="commit", timeout=NAV_TIMEOUT_MS)
+            page.wait_for_timeout(2_500)
+            return False
 
     return False
 
@@ -801,118 +815,29 @@ def return_to_undecided_board(page: Page, *, non_interactive: bool = True) -> No
 
 
 def open_exact_project_text(page: Page, project: str) -> Candidate | None:
-    # Only consider row-sized nodes. Fat ancestors can contain the target name
-    # somewhere below the fold while their first opportunity link is a different project.
-    boxes = page.evaluate(
-        """
-        (project) => {
-          const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-          const target = clean(project).toLowerCase();
-          if (!target) return [];
-          const out = [];
-          const nodes = [...document.querySelectorAll(
-            '[role=row], tr, a[href*="/opportunities/"], [class*=Row], [class*=row]'
-          )];
-
-          for (const el of nodes) {
-            const text = clean(el.innerText || el.textContent || '');
-            if (text.length < 10 || text.length > 500) continue;
-            if (!text.toLowerCase().includes(target)) continue;
-
-            const lower = text.toLowerCase();
-            if (lower.includes('filtered by') || lower.includes('assign name bid date')) continue;
-
-            const rect = el.getBoundingClientRect();
-            const visible =
-              rect.width > 40 &&
-              rect.height > 12 &&
-              rect.bottom >= 0 &&
-              rect.top <= window.innerHeight &&
-              rect.right >= 0 &&
-              rect.left <= window.innerWidth;
-            if (!visible) continue;
-
-            let link = null;
-            if (el.matches?.('a[href*="/opportunities/"]')) {
-              link = el;
-            } else {
-              link = el.querySelector?.('a[href*="/opportunities/"]') || null;
-            }
-
-            out.push({
-              tag: el.tagName,
-              text,
-              href: link?.href || '',
-              x: Math.max(5, Math.min(rect.left + Math.min(180, rect.width / 3), window.innerWidth - 5)),
-              y: Math.max(5, Math.min(rect.top + rect.height / 2, window.innerHeight - 5)),
-            });
-          }
-
-          return out.sort((a, b) => a.text.length - b.text.length).slice(0, 8);
-        }
-        """,
-        project,
-    )
-
-    for box in boxes:
-        label = row_label(box["text"])
-        if norm(project) not in norm(box["text"]) and not likely_match(project, label):
+    # Work only from structurally verified bid rows. A loose get_by_text() can
+    # match a hidden location/address node and navigate to Google Maps instead
+    # of opening the opportunity.
+    for row in visible_bid_rows(page):
+        label = row_label(row.text)
+        if norm(project) not in norm(row.text) and not likely_match(project, label):
             continue
 
-        log(f"Found exact project text in visible DOM: {box['text'][:120]}")
-        opened = False
-        if box["href"]:
-            page.goto(box["href"], wait_until="commit", timeout=NAV_TIMEOUT_MS)
-            page.wait_for_timeout(2_500)
-            opened = is_project_detail_url(page.url)
-
-        if not opened:
-            for click_count in (1, 2):
-                page.mouse.click(box["x"], box["y"], click_count=click_count)
-                page.wait_for_timeout(2_500)
-                if is_project_detail_url(page.url):
-                    opened = True
-                    break
-
+        log(f"Found matching project row in visible DOM: {row.text[:120]}")
+        opened = open_bid_row(page, row)
         if not opened:
             continue
 
         accepted = accept_opened_project(
             page,
             project,
-            matched_text=box["text"],
-            tag=box["tag"],
-            href=box["href"] or page.url,
+            matched_text=row.text,
+            tag=row.tag,
+            href=row.href or page.url,
         )
         if accepted:
             return accepted
         return_to_undecided_board(page)
-
-    try:
-        locator = page.get_by_text(project, exact=False).first
-        locator.wait_for(state="attached", timeout=1_500)
-        locator.scroll_into_view_if_needed(timeout=4_000)
-        page.wait_for_timeout(800)
-        log("Found exact project text outside visible-row scan")
-
-        opened = False
-        for click_count in (1, 2):
-            locator.click(timeout=4_000, click_count=click_count)
-            page.wait_for_timeout(2_500)
-            if is_project_detail_url(page.url):
-                opened = True
-                break
-
-        if not opened and click_project_text_fallback(page, project):
-            opened = is_project_detail_url(page.url)
-
-        if opened:
-            accepted = accept_opened_project(page, project, matched_text=project, tag="TEXT")
-            if accepted:
-                return accepted
-            return_to_undecided_board(page)
-    except Exception:
-        return None
 
     return None
 
@@ -932,6 +857,10 @@ def reset_bid_board_scroll(page: Page) -> None:
 
 
 def go_to_next_bid_board_page(page: Page) -> bool:
+    if not is_bid_board_url(page.url):
+        log(f"Refusing next-page click outside Bid Board: {page.url}")
+        return False
+
     changed = page.evaluate(
         """
         () => {
@@ -950,7 +879,14 @@ def go_to_next_bid_board_page(page: Page) -> bool:
               el.getAttribute('aria-disabled') === 'true' ||
               /disabled/i.test(el.className || '');
 
-            if (!disabled && /(^|\\b)(next|caret-right|›|»)(\\b|$)/i.test(label)) {
+            const pagination = el.closest(
+              'nav, [aria-label*="pagination" i], [class*="pagination" i], [class*="pager" i]'
+            );
+            const nextLabel =
+              /^(next|next page|go to next page|caret-right|›|»)$/i.test(label) ||
+              /\\bnext (page|results?)\\b/i.test(label);
+
+            if (!disabled && pagination && nextLabel) {
               el.scrollIntoView({ block: 'center' });
               el.click();
               return true;
@@ -968,14 +904,61 @@ def go_to_next_bid_board_page(page: Page) -> bool:
 
 
 def visible_bid_rows(page: Page) -> list[BidRow]:
+    if not is_bid_board_url(page.url):
+        return []
+
     rows = page.evaluate(
         """
         () => {
           const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-          const nodes = [...document.querySelectorAll(
-            '[role=row], tr, [class*=Row], [class*=row]'
-          )];
-          const seen = new Set();
+          const rowLike = (el) => {
+            const text = clean(el.innerText || el.textContent || '');
+            const lower = text.toLowerCase();
+            const rect = el.getBoundingClientRect();
+            return (
+              /\\d{1,2}\\/\\d{1,2}\\/\\d{4}/.test(text) &&
+              lower.includes('bidding') &&
+              lower.includes('decline') &&
+              text.length >= 25 &&
+              text.length <= 700 &&
+              rect.width >= 500 &&
+              rect.height >= 24 &&
+              rect.height <= 220
+            );
+          };
+
+          const nodes = [];
+          const nodeSet = new Set();
+          const addNode = (el) => {
+            if (el && !nodeSet.has(el)) {
+              nodeSet.add(el);
+              nodes.push(el);
+            }
+          };
+
+          // The current BuildingConnected board renders rows as ordinary divs
+          // without a stable "row" class. Each row does, however, contain its
+          // due date and the Bidding/Decline actions, so climb from those actions
+          // to the smallest ancestor with the complete row signature.
+          const actions = [...document.querySelectorAll('button, a, [role=button]')]
+            .filter((el) => /^(bidding|decline)$/i.test(clean(el.innerText || el.textContent || '')));
+          for (const action of actions) {
+            let el = action;
+            for (let depth = 0; el && depth < 12; depth += 1, el = el.parentElement) {
+              if (rowLike(el)) {
+                addNode(el);
+                break;
+              }
+            }
+          }
+
+          // Preserve support for older table/ARIA/class-based versions.
+          for (const el of document.querySelectorAll(
+            '[role=row], tr, li, [class*="row" i]'
+          )) {
+            if (rowLike(el)) addNode(el);
+          }
+
           const out = [];
 
           for (const el of nodes) {
@@ -984,20 +967,10 @@ def visible_bid_rows(page: Page) -> list[BidRow]:
             if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
 
             const text = clean(el.innerText || el.textContent || '');
-            if (text.length < 25 || text.length > 500) continue;
+            if (text.length < 25 || text.length > 700) continue;
 
             const lower = text.toLowerCase();
             if (lower.includes('filtered by') || lower.includes('assign name bid date')) continue;
-
-            const rowLike =
-              /\\d{1,2}\\/\\d{1,2}\\/\\d{4}/.test(text) ||
-              /\\d+h\\s+\\d+m/.test(text) ||
-              lower.includes('bidding') ||
-              lower.includes('decline');
-            if (!rowLike) continue;
-
-            if (seen.has(text)) continue;
-            seen.add(text);
 
             const link = el.querySelector?.('a[href*="/opportunities/"]') || el.closest?.('a[href*="/opportunities/"]');
             out.push({
