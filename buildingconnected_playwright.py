@@ -877,7 +877,7 @@ def open_exact_project_text(page: Page, project: str) -> Candidate | None:
             continue
 
         log(f"Found matching project row in visible DOM: {row.text[:120]}")
-        opened = open_bid_row(page, row)
+        opened = open_bid_row(page, row, project)
         if not opened:
             continue
 
@@ -1077,7 +1077,7 @@ def row_matches_project(project: str, row: BidRow) -> bool:
     return likely_match(project, row_label(row.text))
 
 
-def open_bid_row(page: Page, row: BidRow) -> bool:
+def open_bid_row(page: Page, row: BidRow, project: str = "") -> bool:
     if row.href:
         log(f"Opening row href directly: {row.href}")
         page.goto(row.href, wait_until="commit", timeout=NAV_TIMEOUT_MS)
@@ -1099,13 +1099,104 @@ def open_bid_row(page: Page, row: BidRow) -> bool:
     if exact_rows:
         row = min(exact_rows, key=lambda candidate: abs(candidate.y - row.y))
 
-    log(f"Opening matching row by coordinates: {row_label(row.text)}")
-    for click_count in (1, 2):
-        page.mouse.click(row.x, row.y, click_count=click_count)
-        page.wait_for_timeout(2_500)
-        if is_project_detail_url(page.url):
-            return True
-    return False
+    clicked = page.evaluate(
+        """
+        ({ expectedText, expectedLabel, project, priorY }) => {
+          const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+          const norm = (s) => clean(s).toLowerCase().replace(/[^\\w\\s]/g, ' ').replace(/\\s+/g, ' ').trim();
+          const rowLabel = (s) => clean(s).split(/\\b\\d{1,2}\\/\\d{1,2}\\/\\d{4}\\b/)[0];
+          const rowLike = (el) => {
+            const text = clean(el.innerText || el.textContent || '');
+            const lower = text.toLowerCase();
+            const rect = el.getBoundingClientRect();
+            return /\\d{1,2}\\/\\d{1,2}\\/\\d{4}/.test(text) &&
+              lower.includes('bidding') && lower.includes('decline') &&
+              rect.width >= 500 && rect.height >= 24 && rect.height <= 220;
+          };
+
+          const rows = [];
+          const seen = new Set();
+          const add = (el) => {
+            if (el && !seen.has(el) && rowLike(el)) {
+              seen.add(el);
+              rows.push(el);
+            }
+          };
+          for (const action of document.querySelectorAll('button, a, [role=button]')) {
+            if (!/^(bidding|decline)$/i.test(clean(action.innerText || action.textContent || ''))) continue;
+            let el = action;
+            for (let depth = 0; el && depth < 12; depth += 1, el = el.parentElement) {
+              if (rowLike(el)) {
+                add(el);
+                break;
+              }
+            }
+          }
+          for (const el of document.querySelectorAll('[role=row], tr, li, [class*="row" i]')) add(el);
+
+          const expectedTextNorm = norm(expectedText);
+          const expectedLabelNorm = norm(expectedLabel);
+          const matches = rows.filter((el) => {
+            const text = clean(el.innerText || el.textContent || '');
+            return norm(text) === expectedTextNorm || norm(rowLabel(text)) === expectedLabelNorm;
+          }).sort((a, b) =>
+            Math.abs(a.getBoundingClientRect().top + a.getBoundingClientRect().height / 2 - priorY) -
+            Math.abs(b.getBoundingClientRect().top + b.getBoundingClientRect().height / 2 - priorY)
+          );
+          if (!matches.length) return { ok: false, reason: 'matched row no longer visible' };
+
+          const row = matches[0];
+          const projectNorm = norm(project);
+          const choices = [...row.querySelectorAll('a, button, [role=link], div, span')]
+            .map((el) => {
+              const text = clean(el.innerText || el.textContent || '');
+              const textNorm = norm(text);
+              const rect = el.getBoundingClientRect();
+              const truncatedPrefix = text.includes('...') || text.includes('…')
+                ? norm(text.split(/\\.\\.\\.|…/)[0]) : '';
+              const projectMatch = projectNorm && (
+                textNorm.includes(projectNorm) ||
+                (truncatedPrefix.split(' ').length >= 2 && projectNorm.startsWith(truncatedPrefix))
+              );
+              const labelMatch = !projectNorm && expectedLabelNorm.startsWith(textNorm) &&
+                textNorm.split(' ').length >= 2;
+              return { el, text, textNorm, rect, projectMatch, labelMatch };
+            })
+            .filter((item) =>
+              item.rect.width > 0 && item.rect.height > 0 &&
+              !/^(bidding|decline)$/i.test(item.text) &&
+              !/\\d{1,2}\\/\\d{1,2}\\/\\d{4}/.test(item.text) &&
+              (item.projectMatch || item.labelMatch)
+            )
+            .sort((a, b) => {
+              const aSemantic = a.el.matches('a, button, [role=link]') ? 1 : 0;
+              const bSemantic = b.el.matches('a, button, [role=link]') ? 1 : 0;
+              if (aSemantic !== bSemantic) return bSemantic - aSemantic;
+              return projectNorm ? a.text.length - b.text.length : b.text.length - a.text.length;
+            });
+          if (!choices.length) return { ok: false, reason: 'project-name element not found' };
+
+          const target = choices[0].el;
+          target.scrollIntoView({ block: 'center', inline: 'nearest' });
+          target.click();
+          return { ok: true, text: choices[0].text, tag: target.tagName };
+        }
+        """,
+        {
+            "expectedText": row.text,
+            "expectedLabel": row_label(row.text),
+            "project": project,
+            "priorY": row.y,
+        },
+    )
+    if not clicked or not clicked.get("ok"):
+        reason = (clicked or {}).get("reason", "unknown")
+        log(f"Could not click matched project-name element: {reason}")
+        return False
+
+    log(f"Clicked matched project-name element: {clicked.get('text', '')[:120]}")
+    page.wait_for_timeout(2_500)
+    return is_project_detail_url(page.url)
 
 
 def current_page_has_project(page: Page, project: str) -> Candidate | None:
@@ -1184,7 +1275,7 @@ def find_and_open_project(page: Page, project: str) -> Candidate | None:
                 continue
 
             log(f"Matched visible row: {row_label(row.text)}")
-            if open_bid_row(page, row) or click_project_text_fallback(page, project):
+            if open_bid_row(page, row, project) or click_project_text_fallback(page, project):
                 accepted = accept_opened_project(
                     page,
                     project,
