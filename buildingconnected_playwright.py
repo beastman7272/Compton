@@ -132,6 +132,39 @@ def is_project_detail_url(url: str) -> bool:
     return bool(re.search(r"/opportunities/[0-9a-f]+/", url))
 
 
+def project_detail_panel_is_open(page: Page) -> bool:
+    """Detect BC's in-page detail panel, which keeps the /pipeline URL."""
+    try:
+        return bool(
+            page.evaluate(
+                r"""
+                () => {
+                  const clean = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                  const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && rect.bottom >= 0 &&
+                      rect.top <= window.innerHeight && style.display !== 'none' &&
+                      style.visibility !== 'hidden';
+                  };
+                  const labels = [...document.querySelectorAll('a, button, [role=tab]')]
+                    .filter(visible)
+                    .map((el) => clean(el.innerText || el.textContent || ''));
+                  return labels.some((x) => /^files(?:\s+\d+)?$/.test(x)) &&
+                    labels.some((x) => /^messages(?:\s+\d+)?$/.test(x)) &&
+                    labels.some((x) => /^bid form$/.test(x));
+                }
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def is_project_detail_view(page: Page) -> bool:
+    return is_project_detail_url(page.url) or project_detail_panel_is_open(page)
+
+
 def pause_for_user(reason: str) -> None:
     print(f"\n{reason}")
     input("Fix/confirm the browser state, then press Enter to continue...")
@@ -598,7 +631,9 @@ def click_best_dom_candidate(page: Page, project: str) -> Candidate | None:
 
 def click_project_text_fallback(page: Page, project: str) -> bool:
     log("Trying visible project text/coordinate fallbacks")
-    for exact in (True, False):
+    # A partial-text locator can resolve to the entire row; clicking its center can
+    # land on the Location link. Use only the project-name element here.
+    for exact in (True,):
         try:
             locator = page.get_by_text(project, exact=exact).first
             locator.wait_for(state="visible", timeout=4_000)
@@ -606,17 +641,17 @@ def click_project_text_fallback(page: Page, project: str) -> bool:
             log(f"Trying text click fallback exact={exact}")
             locator.click(timeout=4_000)
             page.wait_for_timeout(2_000)
-            if is_project_detail_url(page.url):
+            if is_project_detail_view(page):
                 return True
 
             page.keyboard.press("Enter")
             page.wait_for_timeout(2_000)
-            if is_project_detail_url(page.url):
+            if is_project_detail_view(page):
                 return True
 
             locator.dblclick(timeout=4_000)
             page.wait_for_timeout(2_000)
-            if is_project_detail_url(page.url):
+            if is_project_detail_view(page):
                 return True
         except Exception:
             pass
@@ -641,7 +676,7 @@ def click_project_text_fallback(page: Page, project: str) -> bool:
 
             for (const node of chain) {
               const rect = node.getBoundingClientRect();
-              if (rect.width < 20 || rect.height < 12) continue;
+              if (rect.width < 20 || rect.height < 12 || rect.width > 650 || rect.height > 90) continue;
               if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
               if (rect.right < 0 || rect.left > window.innerWidth) continue;
 
@@ -650,13 +685,15 @@ def click_project_text_fallback(page: Page, project: str) -> bool:
                 role: node.getAttribute('role') || '',
                 cls: String(node.className || '').slice(0, 80),
                 text: clean(node.innerText || node.textContent || '').slice(0, 160),
+                width: rect.width,
+                height: rect.height,
                 x: Math.max(5, Math.min(rect.left + Math.min(120, rect.width / 2), window.innerWidth - 5)),
                 y: Math.max(5, Math.min(rect.top + Math.min(24, rect.height / 2), window.innerHeight - 5)),
               });
             }
           }
 
-          return boxes.slice(0, 10);
+          return boxes.sort((a, b) => (a.width * a.height) - (b.width * b.height)).slice(0, 10);
         }
         """,
         project,
@@ -667,12 +704,12 @@ def click_project_text_fallback(page: Page, project: str) -> bool:
         log(f"Trying coordinate click {idx}: {box['tag']} role={box['role']} class={box['cls']}")
         page.mouse.click(box["x"], box["y"])
         page.wait_for_timeout(2_000)
-        if is_project_detail_url(page.url):
+        if is_project_detail_view(page):
             return True
 
         page.mouse.dblclick(box["x"], box["y"])
         page.wait_for_timeout(2_000)
-        if is_project_detail_url(page.url):
+        if is_project_detail_view(page):
             return True
 
     return False
@@ -733,34 +770,51 @@ def scroll_bid_board(page: Page) -> bool:
     return after_key != before_text
 
 
-def detail_page_matches_project(page: Page, project: str) -> bool:
-    """True when the open opportunity page is the intended project (full name available)."""
-    if not is_project_detail_url(page.url):
-        return False
-
+def current_project_heading(page: Page) -> str:
+    """Read the visible project title near the top of the open detail view."""
     try:
-        title = page.title()
+        headings = page.evaluate(
+            r"""
+            () => {
+              const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+              const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = getComputedStyle(el);
+                return rect.width > 80 && rect.height > 12 && rect.top >= 0 && rect.top < 260 &&
+                  rect.bottom <= window.innerHeight && style.display !== 'none' &&
+                  style.visibility !== 'hidden' && Number(style.opacity || 1) !== 0;
+              };
+              const generic = /^(bid board|overview|files|messages|bid form|due date|status|links)$/i;
+              return [...document.querySelectorAll(
+                'h1, h2, [role=heading], [data-testid*="project" i], ' +
+                '[class*="project-title" i], [class*="opportunity-title" i]'
+              )]
+                .filter(visible)
+                .map((el) => clean(el.innerText || el.textContent || el.getAttribute('title') || ''))
+                .filter((text) => text.length >= 4 && text.length <= 240 && !generic.test(text));
+            }
+            """
+        )
     except Exception:
-        title = ""
-    if title and likely_match(project, title):
-        return True
+        headings = []
+    return str(headings[0]).strip() if headings else ""
 
-    try:
-        body = page.locator("body").inner_text(timeout=5_000)
-    except Exception:
-        body = ""
 
-    for line in (ln.strip() for ln in body.splitlines() if ln.strip()):
-        if len(line) > 260:
-            continue
-        if likely_match(project, line):
-            return True
-
-    if body and likely_match(project, body[:2_000]):
-        return True
-
-    candidates = [c for c in dom_candidates(page, project) if not bad_candidate_text(c.combined)]
-    return bool(candidates and likely_match(project, candidates[0].combined))
+def detail_page_matches_project(page: Page, project: str, *, timeout_ms: int = 10_000) -> bool:
+    """True only when the visible detail heading is the intended project."""
+    deadline = time.monotonic() + max(timeout_ms, 0) / 1_000
+    while True:
+        if is_project_detail_view(page):
+            heading = current_project_heading(page)
+            if heading and likely_match(project, heading):
+                return True
+            if is_project_detail_url(page.url):
+                with contextlib.suppress(Exception):
+                    if likely_match(project, page.title()):
+                        return True
+        if time.monotonic() >= deadline:
+            return False
+        page.wait_for_timeout(400)
 
 
 def accept_opened_project(
@@ -771,7 +825,7 @@ def accept_opened_project(
     tag: str = "",
     href: str = "",
 ) -> Candidate | None:
-    if not is_project_detail_url(page.url):
+    if not is_project_detail_view(page):
         return None
     if not detail_page_matches_project(page, project):
         log(
@@ -864,13 +918,13 @@ def open_exact_project_text(page: Page, project: str) -> Candidate | None:
         if box["href"]:
             page.goto(box["href"], wait_until="commit", timeout=NAV_TIMEOUT_MS)
             page.wait_for_timeout(2_500)
-            opened = is_project_detail_url(page.url)
+            opened = is_project_detail_view(page)
 
         if not opened:
             for click_count in (1, 2):
                 page.mouse.click(box["x"], box["y"], click_count=click_count)
                 page.wait_for_timeout(2_500)
-                if is_project_detail_url(page.url):
+                if is_project_detail_view(page):
                     opened = True
                     break
 
@@ -889,7 +943,7 @@ def open_exact_project_text(page: Page, project: str) -> Candidate | None:
         return_to_undecided_board(page)
 
     try:
-        locator = page.get_by_text(project, exact=False).first
+        locator = page.get_by_text(project, exact=True).first
         locator.wait_for(state="attached", timeout=1_500)
         locator.scroll_into_view_if_needed(timeout=4_000)
         page.wait_for_timeout(800)
@@ -899,12 +953,12 @@ def open_exact_project_text(page: Page, project: str) -> Candidate | None:
         for click_count in (1, 2):
             locator.click(timeout=4_000, click_count=click_count)
             page.wait_for_timeout(2_500)
-            if is_project_detail_url(page.url):
+            if is_project_detail_view(page):
                 opened = True
                 break
 
         if not opened and click_project_text_fallback(page, project):
-            opened = is_project_detail_url(page.url)
+            opened = is_project_detail_view(page)
 
         if opened:
             accepted = accept_opened_project(page, project, matched_text=project, tag="TEXT")
@@ -1040,19 +1094,19 @@ def open_bid_row(page: Page, row: BidRow) -> bool:
         log(f"Opening row href directly: {row.href}")
         page.goto(row.href, wait_until="commit", timeout=NAV_TIMEOUT_MS)
         page.wait_for_timeout(3_000)
-        return is_project_detail_url(page.url)
+        return is_project_detail_view(page)
 
     log(f"Opening matching row by coordinates: {row_label(row.text)}")
     for click_count in (1, 2):
         page.mouse.click(row.x, row.y, click_count=click_count)
         page.wait_for_timeout(2_500)
-        if is_project_detail_url(page.url):
+        if is_project_detail_view(page):
             return True
     return False
 
 
 def current_page_has_project(page: Page, project: str) -> Candidate | None:
-    if not is_project_detail_url(page.url):
+    if not is_project_detail_view(page):
         return None
 
     candidates = [c for c in dom_candidates(page, project) if not bad_candidate_text(c.combined)]
@@ -2159,7 +2213,7 @@ def process_project(
         result["status"] = "FOUND"
         result["matched_text"] = candidate.combined[:220]
 
-        if not is_project_detail_url(page.url):
+        if not is_project_detail_view(page):
             result["status"] = "ERROR"
             result["error"] = "Project matched, but the detail page did not open."
             return result
