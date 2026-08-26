@@ -147,6 +147,39 @@ def is_project_detail_url(url: str) -> bool:
     return bool(re.search(r"/opportunities/[0-9a-f]+/", url))
 
 
+def project_detail_panel_is_open(page: Page) -> bool:
+    """Detect BC's SPA detail panel, which may keep the /pipeline URL."""
+    try:
+        return bool(
+            page.evaluate(
+                """
+                () => {
+                  const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                  const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && rect.bottom >= 0 &&
+                      rect.top <= window.innerHeight && style.display !== 'none' &&
+                      style.visibility !== 'hidden';
+                  };
+                  const labels = [...document.querySelectorAll('a, button, [role=tab]')]
+                    .filter(visible)
+                    .map((el) => clean(el.innerText || el.textContent || ''));
+                  return labels.some((x) => /^files(?:\\s+\\d+)?$/.test(x)) &&
+                    labels.some((x) => /^messages(?:\\s+\\d+)?$/.test(x)) &&
+                    labels.some((x) => /^bid form$/.test(x));
+                }
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def is_project_detail_view(page: Page) -> bool:
+    return is_project_detail_url(page.url) or project_detail_panel_is_open(page)
+
+
 def is_bid_board_url(url: str) -> bool:
     """True only for the BuildingConnected opportunity pipeline itself."""
     return bool(
@@ -708,6 +741,10 @@ def click_project_text_fallback(page: Page, project: str) -> bool:
 
 
 def scroll_bid_board(page: Page) -> bool:
+    if project_detail_panel_is_open(page):
+        log("Refusing to scroll Bid Board while a project detail panel is open")
+        return False
+
     before_text = page.locator("body").inner_text(timeout=5_000)[:4_000]
     # Advance most of a viewport but keep ~1-2 rows of overlap so lazy-loaded
     # projects are not skipped between scans.
@@ -816,14 +853,12 @@ def current_project_heading(page: Page) -> str:
 
 def detail_page_matches_project(page: Page, project: str, *, timeout_ms: int = 10_000) -> bool:
     """True only when the visible detail-page heading is the intended project."""
-    if not is_project_detail_url(page.url):
-        return False
-
     deadline = time.monotonic() + max(timeout_ms, 0) / 1_000
     while True:
-        heading = current_project_heading(page)
-        if heading and likely_match(project, heading):
-            return True
+        if is_project_detail_view(page):
+            heading = current_project_heading(page)
+            if heading and likely_match(project, heading):
+                return True
         if time.monotonic() >= deadline:
             return False
         page.wait_for_timeout(400)
@@ -837,7 +872,7 @@ def accept_opened_project(
     tag: str = "",
     href: str = "",
 ) -> Candidate | None:
-    if not is_project_detail_url(page.url):
+    if not is_project_detail_view(page):
         return None
     if not detail_page_matches_project(page, project):
         heading = current_project_heading(page) or "-- unavailable --"
@@ -857,7 +892,7 @@ def return_to_undecided_board(page: Page, *, non_interactive: bool = True) -> No
         page.go_back(wait_until="commit", timeout=NAV_TIMEOUT_MS)
         page.wait_for_timeout(2_000)
 
-    if is_project_detail_url(page.url) or "pipeline" not in (page.url or "").lower():
+    if is_project_detail_view(page) or "pipeline" not in (page.url or "").lower():
         ensure_pipeline(page, non_interactive=non_interactive)
         sort_by_name(page)
         return
@@ -911,6 +946,9 @@ def reset_bid_board_scroll(page: Page) -> None:
 
 
 def go_to_next_bid_board_page(page: Page) -> bool:
+    if project_detail_panel_is_open(page):
+        log("Refusing next-page click while a project detail panel is open")
+        return False
     if not is_bid_board_url(page.url):
         log(f"Refusing next-page click outside Bid Board: {page.url}")
         return False
@@ -1082,7 +1120,9 @@ def open_bid_row(page: Page, row: BidRow, project: str = "") -> bool:
         log(f"Opening row href directly: {row.href}")
         page.goto(row.href, wait_until="commit", timeout=NAV_TIMEOUT_MS)
         page.wait_for_timeout(3_000)
-        return is_project_detail_url(page.url)
+        if project:
+            return detail_page_matches_project(page, project, timeout_ms=8_000)
+        return is_project_detail_view(page)
 
     # Refresh the row coordinates immediately before clicking. BuildingConnected
     # virtualizes the board, so a saved y-coordinate can point at a different
@@ -1196,11 +1236,13 @@ def open_bid_row(page: Page, row: BidRow, project: str = "") -> bool:
 
     log(f"Clicked matched project-name element: {clicked.get('text', '')[:120]}")
     page.wait_for_timeout(2_500)
-    return is_project_detail_url(page.url)
+    if project:
+        return detail_page_matches_project(page, project, timeout_ms=8_000)
+    return is_project_detail_view(page)
 
 
 def current_page_has_project(page: Page, project: str) -> Candidate | None:
-    if not is_project_detail_url(page.url):
+    if not is_project_detail_view(page):
         return None
 
     if detail_page_matches_project(page, project, timeout_ms=1_500):
@@ -1275,7 +1317,7 @@ def find_and_open_project(page: Page, project: str) -> Candidate | None:
                 continue
 
             log(f"Matched visible row: {row_label(row.text)}")
-            if open_bid_row(page, row, project) or click_project_text_fallback(page, project):
+            if open_bid_row(page, row, project):
                 accepted = accept_opened_project(
                     page,
                     project,
@@ -1417,7 +1459,7 @@ def open_files_tab(page: Page, *, expected_project: str = "") -> bool:
                       style.display !== 'none' && style.visibility !== 'hidden';
                   };
                   const tabs = [...document.querySelectorAll('a, button, [role=tab]')]
-                    .filter((el) => visible(el) && /^(files|project files|documents)$/i.test(clean(el.innerText || el.textContent || '')))
+                    .filter((el) => visible(el) && /^(files(?:\\s+\\d+)?|project files|documents)$/i.test(clean(el.innerText || el.textContent || '')))
                     .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
                   if (!tabs.length) return false;
                   tabs[0].click();
@@ -2376,7 +2418,7 @@ def process_project(
         if not candidate:
             return result
 
-        if not is_project_detail_url(page.url):
+        if not is_project_detail_view(page):
             result["status"] = "ERROR"
             result["error"] = "Project matched, but the detail page did not open."
             return result

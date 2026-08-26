@@ -12,12 +12,18 @@ TARGET = "Crossroads of Gallatin - Gallatin, TN"
 
 
 class _HeadingPage:
-    url = "https://app.buildingconnected.com/opportunities/0123456789abcdef/overview"
-
-    def __init__(self, heading: str):
+    def __init__(self, heading: str, *, panel_open: bool = False):
         self.heading = heading
+        self.panel_open = panel_open
+        self.url = (
+            "https://app.buildingconnected.com/opportunities/pipeline"
+            if panel_open
+            else "https://app.buildingconnected.com/opportunities/0123456789abcdef/overview"
+        )
 
-    def evaluate(self, _script):
+    def evaluate(self, script):
+        if "labels.some" in script:
+            return self.panel_open
         return [self.heading]
 
     def wait_for_timeout(self, _milliseconds):
@@ -60,6 +66,10 @@ class BuildingConnectedProjectMatchingTests(unittest.TestCase):
 
     def test_visible_target_heading_is_accepted(self):
         page = _HeadingPage("Crossroads of Gallatin - Gallatin, TN")
+        self.assertTrue(detail_page_matches_project(page, TARGET, timeout_ms=0))
+
+    def test_visible_target_panel_is_accepted_without_url_change(self):
+        page = _HeadingPage("Crossroads of Gallatin - Gallatin, TN", panel_open=True)
         self.assertTrue(detail_page_matches_project(page, TARGET, timeout_ms=0))
 
 
