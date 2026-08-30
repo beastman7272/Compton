@@ -828,18 +828,6 @@ def phase2_playwright_run(
         print("\nSheets were not updated. Rerun with --apply-playwright-results after reviewing results.")
         return True
 
-    errors = [
-        item
-        for item in results
-        if item["result"].get("status") == "ERROR"
-    ]
-    if errors:
-        print("\nPlaywright returned errors; Sheets were not updated and run_state.json was kept.")
-        if any(item["result"].get("login_required") for item in errors):
-            print("BuildingConnected login/MFA refresh is required before the scheduled workflow can continue.")
-        print("Review playwright_results.json, fix the issue, then rerun the workflow.")
-        return False
-
     bb_rows = read_sheet(service, BID_BOARD_SHEET_ID, sheet_range(BID_BOARD_TAB_NAME, "A1:G1000"))
     bb_data = bb_rows[1:] if len(bb_rows) > 1 else []
 
