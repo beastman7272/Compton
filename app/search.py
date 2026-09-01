@@ -227,6 +227,60 @@ def insert_search_results(
     return result_ids
 
 
+def reindex_filter(
+    conn: sqlite3.Connection,
+    filter_id: int,
+    max_matches_per_term: int = DEFAULT_MATCH_LIMIT_PER_TERM,
+) -> list[int]:
+    """Refresh one active filter without disturbing other filters' results."""
+    row = conn.execute(
+        "SELECT id, name, category, is_active FROM search_filters WHERE id = ? AND is_active = 1",
+        (filter_id,),
+    ).fetchone()
+    if not row:
+        return []
+
+    search_filter = SearchFilter(
+        id=row["id"],
+        name=row["name"],
+        category=row["category"],
+        is_active=True,
+    )
+    terms = [
+        SearchTerm(id=term["id"], filter_id=filter_id, term=term["term"])
+        for term in conn.execute(
+            "SELECT id, term FROM search_terms WHERE filter_id = ? ORDER BY term",
+            (filter_id,),
+        ).fetchall()
+    ]
+    result_ids: list[int] = []
+
+    uploads = conn.execute(
+        "SELECT id, project_id, stored_path FROM uploads WHERE LOWER(file_type) = 'pdf'"
+    ).fetchall()
+    for upload in uploads:
+        try:
+            pages = extract_pdf_text(upload["stored_path"], upload["id"]).pages
+        except Exception as exc:
+            print(f"Skipping upload {upload['id']} while re-indexing filter {filter_id}: {exc}")
+            continue
+
+        conn.execute(
+            "DELETE FROM search_results WHERE upload_id = ? AND filter_id = ?",
+            (upload["id"], filter_id),
+        )
+        result_ids.extend(
+            insert_search_results(
+                conn,
+                upload["project_id"],
+                upload["id"],
+                search_pages(pages, [(search_filter, terms)], max_matches_per_term),
+            )
+        )
+
+    return result_ids
+
+
 def mark_upload_status(
     conn: sqlite3.Connection,
     upload_id: int,

@@ -22,6 +22,7 @@ from app.importer import import_manual_attachment, import_project_from_source
 from app.models import ImportItem
 from app.pdf_subset import build_selected_pages_pdf
 from app.project_deletion import delete_projects_and_storage
+from app.search import reindex_filter
 
 import re
 
@@ -397,7 +398,9 @@ def create_app() -> Flask:
                     COUNT(DISTINCT sr.id) AS match_count
                 FROM projects p
                 LEFT JOIN uploads u ON u.project_id = p.id
-                LEFT JOIN search_results sr ON sr.project_id = p.id
+                LEFT JOIN search_results sr
+                    ON sr.project_id = p.id
+                    AND sr.filter_id IN (SELECT id FROM search_filters WHERE is_active = 1)
                 {where_sql}
                 GROUP BY p.id
                 ORDER BY p.updated_at DESC, p.id DESC
@@ -423,7 +426,7 @@ def create_app() -> Flask:
                         u.stored_filename,
                         sr.page_number
                     FROM search_results sr
-                    JOIN search_filters sf ON sf.id = sr.filter_id
+                    JOIN search_filters sf ON sf.id = sr.filter_id AND sf.is_active = 1
                     JOIN search_terms st ON st.id = sr.term_id
                     JOIN uploads u ON u.id = sr.upload_id
                     WHERE sr.project_id IN ({placeholders})
@@ -472,7 +475,7 @@ def create_app() -> Flask:
             where_sql = "WHERE p.status = ?"
             params.append(status_filter)
 
-        with get_connection(DB_PATH) as conn:
+        with closing(get_connection(DB_PATH)) as conn:
             status_rows = conn.execute(
                 """
                 SELECT status, COUNT(*) AS count
@@ -503,7 +506,7 @@ def create_app() -> Flask:
                 FROM search_results sr
                 JOIN projects p ON p.id = sr.project_id
                 JOIN uploads u ON u.id = sr.upload_id
-                JOIN search_filters sf ON sf.id = sr.filter_id
+                JOIN search_filters sf ON sf.id = sr.filter_id AND sf.is_active = 1
                 JOIN search_terms st ON st.id = sr.term_id
                 {where_sql}
                 ORDER BY p.updated_at DESC, p.state, p.name, sf.category, sf.name, st.term, u.stored_filename, sr.page_number
@@ -570,7 +573,10 @@ def create_app() -> Flask:
                     p.status,
                     COUNT(u.id) AS upload_count,
                     EXISTS (
-                        SELECT 1 FROM search_results sr WHERE sr.project_id = p.id
+                        SELECT 1
+                        FROM search_results sr
+                        JOIN search_filters sf ON sf.id = sr.filter_id
+                        WHERE sr.project_id = p.id AND sf.is_active = 1
                     ) AS has_search_results
                 FROM projects p
                 LEFT JOIN uploads u ON u.project_id = p.id
@@ -847,7 +853,7 @@ def create_app() -> Flask:
                     sr.page_number,
                     sr.context_text
                 FROM search_results sr
-                JOIN search_filters sf ON sf.id = sr.filter_id
+                JOIN search_filters sf ON sf.id = sr.filter_id AND sf.is_active = 1
                 JOIN search_terms st ON st.id = sr.term_id
                 JOIN uploads u ON u.id = sr.upload_id
                 WHERE sr.project_id = ?
@@ -1259,7 +1265,7 @@ def create_app() -> Flask:
     def edit_search_filter(filter_id: int):
         errors = []
 
-        with get_connection(DB_PATH) as conn:
+        with closing(get_connection(DB_PATH)) as conn:
             search_filter = conn.execute(
                 """
                 SELECT id, name, category, is_active
@@ -1274,7 +1280,7 @@ def create_app() -> Flask:
 
             term_rows = conn.execute(
                 """
-                SELECT term
+                SELECT id, term
                 FROM search_terms
                 WHERE filter_id = ?
                 ORDER BY term
@@ -1323,6 +1329,10 @@ def create_app() -> Flask:
                     errors.append("A search filter with this name already exists.")
 
                 if not errors:
+                    requested_terms = {term.casefold(): term for term in terms}
+                    existing_terms = {row["term"].casefold(): row for row in term_rows}
+                    terms_changed = requested_terms.keys() != existing_terms.keys()
+
                     conn.execute(
                         """
                         UPDATE search_filters
@@ -1335,31 +1345,24 @@ def create_app() -> Flask:
                         (name, category, 1 if is_active else 0, filter_id),
                     )
 
-                    conn.execute(
-                        """
-                        DELETE FROM search_terms
-                        WHERE filter_id = ?
-                        """,
-                        (filter_id,),
-                    )
+                    for key, row in existing_terms.items():
+                        if key not in requested_terms:
+                            conn.execute("DELETE FROM search_terms WHERE id = ?", (row["id"],))
+                        elif row["term"] != requested_terms[key]:
+                            conn.execute(
+                                "UPDATE search_terms SET term = ? WHERE id = ?",
+                                (requested_terms[key], row["id"]),
+                            )
 
-                    seen_terms = set()
+                    for key, term in requested_terms.items():
+                        if key not in existing_terms:
+                            conn.execute(
+                                "INSERT INTO search_terms (filter_id, term) VALUES (?, ?)",
+                                (filter_id, term),
+                            )
 
-                    for term in terms:
-                        key = term.lower()
-
-                        if key in seen_terms:
-                            continue
-
-                        seen_terms.add(key)
-
-                        conn.execute(
-                            """
-                            INSERT INTO search_terms (filter_id, term)
-                            VALUES (?, ?)
-                            """,
-                            (filter_id, term),
-                        )
+                    if is_active and (terms_changed or not search_filter["is_active"]):
+                        reindex_filter(conn, filter_id)
 
                     conn.commit()
 
@@ -1422,6 +1425,7 @@ def create_app() -> Flask:
                 FROM search_results sr
                 JOIN uploads u ON u.id = sr.upload_id
                 JOIN search_terms st ON st.id = sr.term_id
+                JOIN search_filters sf ON sf.id = sr.filter_id AND sf.is_active = 1
                 WHERE sr.project_id = ?
                   AND lower(st.term) = lower(?)
                 ORDER BY u.stored_filename, sr.page_number
