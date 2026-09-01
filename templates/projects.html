@@ -30,6 +30,7 @@
             <th>Bid Date</th>
             <th>Budget</th>
             <th>Uploads</th>
+            <th>Search Results</th>
             <th>Status</th>
             <th class="select-cell">Delete</th>
         </tr>
@@ -47,6 +48,13 @@
             <td>{{ row["bid_date"] }}</td>
             <td>{{ row["budget"] }}</td>
             <td>{{ row["upload_count"] }}</td>
+            <td>
+                {% if row["has_search_results"] %}
+                <span class="status-pill">Matches Found</span>
+                {% else %}
+                <span class="status-pill warning-pill">No Matches</span>
+                {% endif %}
+            </td>
             <td><span class="status-pill">{{ row["status"] }}</span></td>
             <td class="select-cell">
                 <input

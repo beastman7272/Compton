@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from contextlib import closing
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -556,7 +557,7 @@ def create_app() -> Flask:
 
     @app.route("/projects")
     def projects():
-        with get_connection(DB_PATH) as conn:
+        with closing(get_connection(DB_PATH)) as conn:
             rows = conn.execute(
                 """
                 SELECT
@@ -567,7 +568,10 @@ def create_app() -> Flask:
                     p.bid_date,
                     p.budget,
                     p.status,
-                    COUNT(u.id) AS upload_count
+                    COUNT(u.id) AS upload_count,
+                    EXISTS (
+                        SELECT 1 FROM search_results sr WHERE sr.project_id = p.id
+                    ) AS has_search_results
                 FROM projects p
                 LEFT JOIN uploads u ON u.project_id = p.id
                 GROUP BY p.id

@@ -143,6 +143,11 @@ h2 {
     white-space: nowrap;
 }
 
+.warning-pill {
+    background: #fef2f2;
+    color: #b91c1c;
+}
+
 .project-group {
     border-top: 1px solid #e5e7eb;
     padding: 16px 0;
