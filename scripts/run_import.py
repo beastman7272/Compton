@@ -59,6 +59,7 @@ MANUFACTURER_DAYS = {
     "Fortress": {"tuesday"},
     "Fabral": {"wednesday"},
     "Metal-Era": {"thursday"},
+    "Bilco": {"friday"},
     "Roof Schedule": {"saturday"},
     "Fortress Alt Words SE": {"sunday"},
 }
