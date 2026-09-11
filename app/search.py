@@ -227,12 +227,13 @@ def insert_search_results(
     return result_ids
 
 
-def reindex_filter(
+def reindex_filter_upload(
     conn: sqlite3.Connection,
     filter_id: int,
+    upload_id: int,
     max_matches_per_term: int = DEFAULT_MATCH_LIMIT_PER_TERM,
 ) -> list[int]:
-    """Refresh one active filter without disturbing other filters' results."""
+    """Refresh one filter/upload pair without disturbing other results."""
     row = conn.execute(
         "SELECT id, name, category, is_active FROM search_filters WHERE id = ? AND is_active = 1",
         (filter_id,),
@@ -253,30 +254,49 @@ def reindex_filter(
             (filter_id,),
         ).fetchall()
     ]
-    result_ids: list[int] = []
+    upload = conn.execute(
+        """SELECT id, project_id, stored_path FROM uploads
+        WHERE id = ? AND LOWER(file_type) = 'pdf'""",
+        (upload_id,),
+    ).fetchone()
+    if not upload:
+        return []
 
-    uploads = conn.execute(
-        "SELECT id, project_id, stored_path FROM uploads WHERE LOWER(file_type) = 'pdf'"
+    pages = extract_pdf_text(upload["stored_path"], upload["id"]).pages
+    conn.execute(
+        "DELETE FROM search_results WHERE upload_id = ? AND filter_id = ?",
+        (upload_id, filter_id),
+    )
+    return insert_search_results(
+        conn,
+        upload["project_id"],
+        upload_id,
+        search_pages(pages, [(search_filter, terms)], max_matches_per_term),
+    )
+
+
+def reindex_filter(
+    conn: sqlite3.Connection,
+    filter_id: int,
+    max_matches_per_term: int = DEFAULT_MATCH_LIMIT_PER_TERM,
+) -> list[int]:
+    """Refresh one active filter without disturbing other filters' results."""
+    result_ids: list[int] = []
+    upload_ids = conn.execute(
+        "SELECT id FROM uploads WHERE LOWER(file_type) = 'pdf' ORDER BY id"
     ).fetchall()
-    for upload in uploads:
+    for upload in upload_ids:
         try:
-            pages = extract_pdf_text(upload["stored_path"], upload["id"]).pages
+            result_ids.extend(
+                reindex_filter_upload(
+                    conn,
+                    filter_id,
+                    upload["id"],
+                    max_matches_per_term,
+                )
+            )
         except Exception as exc:
             print(f"Skipping upload {upload['id']} while re-indexing filter {filter_id}: {exc}")
-            continue
-
-        conn.execute(
-            "DELETE FROM search_results WHERE upload_id = ? AND filter_id = ?",
-            (upload["id"], filter_id),
-        )
-        result_ids.extend(
-            insert_search_results(
-                conn,
-                upload["project_id"],
-                upload["id"],
-                search_pages(pages, [(search_filter, terms)], max_matches_per_term),
-            )
-        )
 
     return result_ids
 

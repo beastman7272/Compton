@@ -22,7 +22,12 @@ from app.importer import import_manual_attachment, import_project_from_source
 from app.models import ImportItem
 from app.pdf_subset import build_selected_pages_pdf
 from app.project_deletion import delete_projects_and_storage
-from app.search import reindex_filter
+from app.reindex_jobs import (
+    cancel_filter_jobs,
+    enqueue_filter_reindex,
+    retry_reindex_job,
+    start_reindex_worker,
+)
 
 import re
 
@@ -344,11 +349,26 @@ def import_item_for_existing_project(project_row) -> ImportItem:
     )
 
 
-def create_app() -> Flask:
+def create_app(*, start_background_workers: bool = False) -> Flask:
     config.ensure_runtime_dirs()
     init_db(DB_PATH)
 
     app = Flask(__name__)
+    app.config["START_REINDEX_WORKER"] = start_background_workers
+    if start_background_workers:
+        start_reindex_worker(DB_PATH)
+
+    @app.context_processor
+    def search_reindex_notice():
+        with closing(get_connection(DB_PATH)) as conn:
+            job = conn.execute(
+                """SELECT j.*, sf.name AS filter_name
+                FROM search_reindex_jobs j
+                JOIN search_filters sf ON sf.id = j.filter_id
+                WHERE j.acknowledged_at IS NULL AND j.status != 'superseded'
+                ORDER BY j.id DESC LIMIT 1"""
+            ).fetchone()
+        return {"search_reindex_job": job}
 
     @app.route("/")
     def home():
@@ -1157,7 +1177,7 @@ def create_app() -> Flask:
 
     @app.route("/search-filters")
     def search_filters():
-        with get_connection(DB_PATH) as conn:
+        with closing(get_connection(DB_PATH)) as conn:
             rows = conn.execute(
                 """
                 SELECT
@@ -1329,6 +1349,7 @@ def create_app() -> Flask:
                     errors.append("A search filter with this name already exists.")
 
                 if not errors:
+                    job_id = None
                     requested_terms = {term.casefold(): term for term in terms}
                     existing_terms = {row["term"].casefold(): row for row in term_rows}
                     terms_changed = requested_terms.keys() != existing_terms.keys()
@@ -1344,6 +1365,7 @@ def create_app() -> Flask:
                         """,
                         (name, category, 1 if is_active else 0, filter_id),
                     )
+                    cancel_filter_jobs(conn, filter_id)
 
                     for key, row in existing_terms.items():
                         if key not in requested_terms:
@@ -1362,9 +1384,12 @@ def create_app() -> Flask:
                             )
 
                     if is_active and (terms_changed or not search_filter["is_active"]):
-                        reindex_filter(conn, filter_id)
+                        job_id = enqueue_filter_reindex(conn, filter_id)
 
                     conn.commit()
+
+                    if job_id and app.config["START_REINDEX_WORKER"]:
+                        start_reindex_worker(DB_PATH)
 
                     return redirect(url_for("search_filters"))
 
@@ -1404,6 +1429,39 @@ def create_app() -> Flask:
             )
             conn.commit()
 
+        return redirect(url_for("search_filters"))
+
+    @app.route("/search-reindex-jobs/<int:job_id>")
+    def search_reindex_job_status(job_id: int):
+        with closing(get_connection(DB_PATH)) as conn:
+            job = conn.execute(
+                """SELECT id, status, processed_uploads, total_uploads,
+                failed_uploads, error_text FROM search_reindex_jobs WHERE id = ?""",
+                (job_id,),
+            ).fetchone()
+        if not job:
+            abort(404)
+        return dict(job)
+
+    @app.route("/search-reindex-jobs/<int:job_id>/acknowledge", methods=["POST"])
+    def acknowledge_search_reindex_job(job_id: int):
+        with closing(get_connection(DB_PATH)) as conn, conn:
+            conn.execute(
+                """UPDATE search_reindex_jobs SET acknowledged_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP WHERE id <= ?
+                AND status IN ('completed', 'failed', 'superseded')""",
+                (job_id,),
+            )
+        return {"status": "acknowledged"}
+
+    @app.route("/search-reindex-jobs/<int:job_id>/retry", methods=["POST"])
+    def retry_search_reindex(job_id: int):
+        with closing(get_connection(DB_PATH)) as conn, conn:
+            new_job_id = retry_reindex_job(conn, job_id)
+        if not new_job_id:
+            abort(409, "Only failed jobs can be retried")
+        if app.config["START_REINDEX_WORKER"]:
+            start_reindex_worker(DB_PATH)
         return redirect(url_for("search_filters"))
 
     @app.route("/projects/<int:project_id>/term-highlight")
@@ -1632,8 +1690,9 @@ def create_app() -> Flask:
     return app
 
 
-app = create_app()
+app = create_app(start_background_workers=config.HOSTED_RUNTIME)
 
 
 if __name__ == "__main__":
+    start_reindex_worker(DB_PATH)
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)

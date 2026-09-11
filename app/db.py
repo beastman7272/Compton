@@ -149,6 +149,24 @@ def create_tables(conn: sqlite3.Connection) -> None:
                 ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS search_reindex_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filter_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued',
+            max_upload_id INTEGER NOT NULL DEFAULT 0,
+            last_upload_id INTEGER NOT NULL DEFAULT 0,
+            total_uploads INTEGER NOT NULL DEFAULT 0,
+            processed_uploads INTEGER NOT NULL DEFAULT 0,
+            failed_uploads INTEGER NOT NULL DEFAULT 0,
+            error_text TEXT,
+            acknowledged_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            started_at TEXT,
+            completed_at TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (filter_id) REFERENCES search_filters(id) ON DELETE CASCADE
+        );
+
         CREATE TABLE IF NOT EXISTS project_contacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
 
@@ -211,6 +229,9 @@ def create_indexes(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_search_results_filter_term
             ON search_results(filter_id, term_id);
+
+        CREATE INDEX IF NOT EXISTS idx_search_reindex_jobs_status
+            ON search_reindex_jobs(status, id);
 
         CREATE INDEX IF NOT EXISTS idx_project_contacts_project
             ON project_contacts(project_id);

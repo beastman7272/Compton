@@ -9,6 +9,7 @@ import fitz
 
 import app_web
 from app.db import get_connection, init_db
+from app.reindex_jobs import process_queued_jobs
 from app.search import index_upload
 
 
@@ -19,7 +20,7 @@ class SearchFilterEditTests(unittest.TestCase):
         self.pdf_path = Path(self.temp_dir.name) / "plans.pdf"
         with fitz.open() as document:
             page = document.new_page()
-            page.insert_text((72, 72), "Fabral R Panel Metal Roof Bilco Fortress")
+            page.insert_text((72, 72), "Fabral R Panel Hefti-Rib Bilco Fortress")
             document.save(self.pdf_path)
 
         init_db(self.db_path)
@@ -58,7 +59,7 @@ class SearchFilterEditTests(unittest.TestCase):
         )
         return int(filter_id)
 
-    def test_term_edit_preserves_other_matches_and_indexes_new_term(self) -> None:
+    def test_term_edit_saves_before_background_reindex(self) -> None:
         with closing(get_connection(self.db_path)) as conn:
             original_term_id = conn.execute(
                 "SELECT id FROM search_terms WHERE filter_id = ? AND term = 'Fabral'",
@@ -70,7 +71,7 @@ class SearchFilterEditTests(unittest.TestCase):
             data={
                 "name": "Fabral",
                 "category": "Roofing",
-                "terms": "Fabral\nMetal Roof",
+                "terms": "Fabral\nHefti-Rib",
                 "is_active": "1",
             },
         )
@@ -81,19 +82,70 @@ class SearchFilterEditTests(unittest.TestCase):
                 "SELECT id, term FROM search_terms WHERE filter_id = ? ORDER BY term",
                 (self.fabral_id,),
             ).fetchall()
+            job = conn.execute(
+                "SELECT id, status FROM search_reindex_jobs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+
+        self.assertEqual([row["term"] for row in terms], ["Fabral", "Hefti-Rib"])
+        self.assertEqual(terms[0]["id"], original_term_id)
+        self.assertEqual(job["status"], "queued")
+        self.assertIn(
+            "Filter updated. Search Results are being refreshed.",
+            self.client.get("/search-filters").get_data(as_text=True),
+        )
+
+        process_queued_jobs(self.db_path)
+        with closing(get_connection(self.db_path)) as conn:
             matches = conn.execute(
                 """SELECT sf.name, st.term FROM search_results sr
                 JOIN search_filters sf ON sf.id = sr.filter_id
                 JOIN search_terms st ON st.id = sr.term_id
                 ORDER BY sf.name, st.term"""
             ).fetchall()
+            status = conn.execute(
+                "SELECT status FROM search_reindex_jobs WHERE id = ?",
+                (job["id"],),
+            ).fetchone()["status"]
 
-        self.assertEqual([row["term"] for row in terms], ["Fabral", "Metal Roof"])
-        self.assertEqual(terms[0]["id"], original_term_id)
+        self.assertEqual(status, "completed")
         self.assertEqual(
             {(row["name"], row["term"]) for row in matches},
-            {("Bilco", "Bilco"), ("Fabral", "Fabral"), ("Fabral", "Metal Roof"), ("Fencing", "Fortress")},
+            {("Bilco", "Bilco"), ("Fabral", "Fabral"), ("Fabral", "Hefti-Rib"), ("Fencing", "Fortress")},
         )
+        self.assertIn(
+            "Search Results Updated.",
+            self.client.get("/search-filters").get_data(as_text=True),
+        )
+
+    def test_failed_reindex_shows_retry_action(self) -> None:
+        response = self.client.post(
+            f"/search-filters/{self.fabral_id}/edit",
+            data={
+                "name": "Fabral",
+                "category": "Roofing",
+                "terms": "Fabral\nR Panel\nHefti-Rib",
+                "is_active": "1",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        self.pdf_path.unlink()
+        process_queued_jobs(self.db_path)
+
+        html = self.client.get("/search-filters").get_data(as_text=True)
+        self.assertIn("Search Results could not be updated.", html)
+        self.assertIn(">Retry</button>", html)
+
+        with closing(get_connection(self.db_path)) as conn:
+            failed_job_id = conn.execute(
+                "SELECT id FROM search_reindex_jobs WHERE status = 'failed'"
+            ).fetchone()["id"]
+        response = self.client.post(f"/search-reindex-jobs/{failed_job_id}/retry")
+        self.assertEqual(response.status_code, 302)
+        with closing(get_connection(self.db_path)) as conn:
+            status = conn.execute(
+                "SELECT status FROM search_reindex_jobs ORDER BY id DESC LIMIT 1"
+            ).fetchone()["status"]
+        self.assertEqual(status, "queued")
 
     def test_deactivation_keeps_terms_and_existing_matches(self) -> None:
         with closing(get_connection(self.db_path)) as conn:

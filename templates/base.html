@@ -27,8 +27,64 @@
     </aside>
 
     <main class="content">
+        {% if search_reindex_job %}
+        <div id="search-reindex-notice"
+             class="reindex-notice reindex-{{ search_reindex_job['status'] }}"
+             data-job-id="{{ search_reindex_job['id'] }}"
+             data-status="{{ search_reindex_job['status'] }}">
+            <span id="search-reindex-message"></span>
+            <form id="search-reindex-retry" method="post"
+                  action="{{ url_for('retry_search_reindex', job_id=search_reindex_job['id']) }}">
+                <button class="button-secondary" type="submit">Retry</button>
+            </form>
+        </div>
+        {% endif %}
         {% block content %}{% endblock %}
     </main>
 </div>
+{% if search_reindex_job %}
+<script>
+    (() => {
+        const notice = document.getElementById("search-reindex-notice");
+        const message = document.getElementById("search-reindex-message");
+        const retry = document.getElementById("search-reindex-retry");
+        const jobId = notice.dataset.jobId;
+        let acknowledged = false;
+
+        function render(status) {
+            notice.className = `reindex-notice reindex-${status}`;
+            retry.hidden = status !== "failed";
+            message.textContent = status === "completed"
+                ? "Search Results Updated."
+                : status === "failed"
+                    ? "Search Results could not be updated."
+                    : "Filter updated. Search Results are being refreshed.";
+
+            if (status === "completed" && !acknowledged) {
+                acknowledged = true;
+                setTimeout(() => fetch(`/search-reindex-jobs/${jobId}/acknowledge`, {
+                    method: "POST"
+                }), 8000);
+            }
+        }
+
+        async function poll() {
+            try {
+                const response = await fetch(`/search-reindex-jobs/${jobId}`);
+                const job = await response.json();
+                render(job.status);
+                if (job.status === "queued" || job.status === "running") {
+                    setTimeout(poll, 2000);
+                }
+            } catch (_) {
+                setTimeout(poll, 5000);
+            }
+        }
+
+        render(notice.dataset.status);
+        if (["queued", "running"].includes(notice.dataset.status)) poll();
+    })();
+</script>
+{% endif %}
 </body>
 </html>
