@@ -27,6 +27,7 @@ MANUFACTURER_DAYS = {
     "Metal-Era": {"thursday"},
     "Bilco": {"friday"},
     "Roof Schedule": {"saturday"},
+    "Fortress Hidden Scope": {"saturday"},
     "Fortress Alt Words SE": {"sunday"},
 }
 
@@ -115,21 +116,75 @@ def scheduled_manufacturers(run_day: str) -> list[str]:
     ]
 
 
+def subject_belongs_to_manufacturer(subject: str, manufacturer: str) -> bool:
+    """Assign overlapping subject phrases to the most specific manufacturer."""
+    normalized_subject = normalize_text(subject)
+    matching_manufacturers = [
+        name
+        for name in MANUFACTURER_DAYS
+        if normalize_text(name) in normalized_subject
+    ]
+
+    if manufacturer not in matching_manufacturers:
+        return False
+
+    most_specific_length = max(len(normalize_text(name)) for name in matching_manufacturers)
+    return len(normalize_text(manufacturer)) == most_specific_length
+
+
+def message_subject(gmail_service, message_id: str) -> str:
+    message = (
+        gmail_service.users()
+        .messages()
+        .get(
+            userId="me",
+            id=message_id,
+            format="metadata",
+            metadataHeaders=["Subject"],
+        )
+        .execute()
+    )
+    headers = message.get("payload", {}).get("headers", [])
+    return next(
+        (header.get("value", "") for header in headers if header.get("name", "").lower() == "subject"),
+        "",
+    )
+
+
 def find_matching_messages(gmail_service, subject_text: str) -> list[str]:
     # For local testing, forwarded emails may come from different accounts.
     # Add back f"from:{EMAIL_FROM} " when matching against original production senders.
+    # Exclude longer configured names that contain this phrase so, for example,
+    # Tuesday's Fortress run cannot consume a Fortress Hidden Scope email.
+    normalized_subject_text = normalize_text(subject_text)
+    exclusions = [
+        name
+        for name in MANUFACTURER_DAYS
+        if name != subject_text and normalized_subject_text in normalize_text(name)
+    ]
+    exclusion_query = " ".join(f'-subject:"{name}"' for name in exclusions)
+    query_suffix = f" {exclusion_query}" if exclusion_query else ""
     queries = [
-        f'subject:"{subject_text}" is:unread newer_than:5d has:attachment',
-        f"subject:{subject_text} is:unread newer_than:5d has:attachment",
-        f'"{subject_text}" is:unread newer_than:5d has:attachment',
+        f'subject:"{subject_text}" is:unread newer_than:5d has:attachment{query_suffix}',
+        f"subject:{subject_text} is:unread newer_than:5d has:attachment{query_suffix}",
+        f'"{subject_text}" is:unread newer_than:5d has:attachment{query_suffix}',
     ]
 
     for query in queries:
-        result = gmail_service.users().messages().list(userId="me", q=query, maxResults=10).execute()
+        result = gmail_service.users().messages().list(userId="me", q=query, maxResults=25).execute()
         messages = result.get("messages", [])
         print(f"Gmail search matched {len(messages)} message(s): {query}")
-        if messages:
-            return [message["id"] for message in messages]
+        matching_ids = []
+        for message in messages:
+            message_id = message["id"]
+            subject = message_subject(gmail_service, message_id)
+            if subject_belongs_to_manufacturer(subject, subject_text):
+                matching_ids.append(message_id)
+            else:
+                print(f"Ignoring overlapping manufacturer subject: {subject!r}")
+
+        if matching_ids:
+            return matching_ids
 
     return []
 
@@ -257,7 +312,7 @@ def append_to_sheet(sheets_service, tab_name: str, rows: list[list]) -> None:
 def process_manufacturer(gmail_service, sheets_service, manufacturer: str) -> int:
     message_ids = find_matching_messages(gmail_service, manufacturer)
     if not message_ids:
-        print(f"No unread {manufacturer} email found in the last day.")
+        print(f"No unread {manufacturer} email found in the last five days.")
         return 0
 
     appended_count = 0

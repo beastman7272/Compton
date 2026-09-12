@@ -49,8 +49,8 @@ Driven by `--run-day` (weekday name), **not** a fixed Railway env var:
 | Tuesday | Fortress |
 | Wednesday | Fabral |
 | Thursday | Metal-Era |
-| Friday | none |
-| Saturday | Roof Schedule |
+| Friday | Bilco |
+| Saturday | Roof Schedule; Fortress Hidden Scope |
 | Sunday | Fortress Alt Words SE |
 
 ---
