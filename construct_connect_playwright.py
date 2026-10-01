@@ -43,7 +43,7 @@ MANUFACTURER_DAYS = {
     "Citadel": {"monday"},
     "Fortress": {"tuesday"},
     "Fabral": {"wednesday"},
-    "Metal-Era": {"thursday"},
+    "Metal Era": {"thursday"},
     "Bilco": {"friday"},
     "Roof Schedule": {"saturday"},
     "Fortress Hidden Scope": {"saturday"},
